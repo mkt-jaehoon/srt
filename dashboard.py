@@ -10,8 +10,8 @@ ENV (.env):
     SRT_INTERVAL=4                 폴링 간격(초)
     SRT_STANDBY=0                  1이면 일반 예매 안 잡힐 때 예약대기까지
 
-    # 알림 (eksska12@gmail.com 으로 전송)
-    NOTIFY_EMAIL=eksska12@gmail.com
+    # 알림 (쉼표로 여러 수신자 지정 가능)
+    NOTIFY_EMAIL=eksska12@naver.com
     SMTP_HOST=smtp.gmail.com
     SMTP_PORT=587
     SMTP_USER=<발신용 Gmail>
@@ -21,14 +21,14 @@ ENV (.env):
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import os
 import smtplib
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from SRT import SRT
 from SRT.errors import SRTError, SRTLoginError, SRTResponseError
 from SRT.passenger import Adult
+from SRT.seat_type import SeatType
 
 
 load_dotenv()
@@ -71,6 +72,7 @@ LEGS: dict[str, dict[str, Any]] = {
 INTERVAL = float(os.getenv("SRT_INTERVAL", "4"))
 STANDBY = os.getenv("SRT_STANDBY", "0") == "1"
 PORT = int(os.getenv("DASH_PORT", "8765"))
+BOOKING_RETRY_AFTER_SECONDS = int(os.getenv("SRT_BOOKING_RETRY_AFTER_SECONDS", "600"))
 TIME_OPTIONS_PATH = Path(os.getenv("SRT_TIME_OPTIONS_PATH", "time_options.json"))
 TIME_OPTIONS_ROUTE = {"dep": "수서", "arr": "부산"}
 
@@ -152,12 +154,54 @@ def save_time_options(config: dict[str, Any]) -> None:
         encoding="utf-8",
     )
 
+
+def leg_route(cfg: dict[str, Any]) -> dict[str, str]:
+    return {
+        "dep": str(cfg.get("dep") or TIME_OPTIONS_ROUTE["dep"]),
+        "arr": str(cfg.get("arr") or TIME_OPTIONS_ROUTE["arr"]),
+    }
+
+
+def retry_at_from(captured_at: datetime) -> datetime:
+    return captured_at + timedelta(seconds=BOOKING_RETRY_AFTER_SECONDS)
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def reservation_result(
+    result_type: str,
+    reserve_obj,
+    train,
+    captured_at: datetime,
+) -> dict[str, Any]:
+    return {
+        "type": result_type,
+        "summary": str(reserve_obj),
+        "reservation_number": getattr(reserve_obj, "reservation_number", None),
+        "payment_deadline": (
+            f"{getattr(reserve_obj, 'payment_date', '')} "
+            f"{getattr(reserve_obj, 'payment_time', '')}"
+        ).strip(),
+        "paid": bool(getattr(reserve_obj, "paid", False)),
+        "train": serialize_train(train),
+        "captured_at": captured_at.isoformat(timespec="seconds"),
+        "retry_after_at": retry_at_from(captured_at).isoformat(timespec="seconds"),
+    }
+
+
 def _parse_emails(raw: str) -> list[str]:
     return [e.strip() for e in raw.split(",") if e.strip()]
 
 
 NOTIFY_EMAILS: list[str] = _parse_emails(
-    os.getenv("NOTIFY_EMAIL", "eksska12@gmail.com")
+    os.getenv("NOTIFY_EMAIL", "eksska12@naver.com")
 )
 
 
@@ -205,8 +249,8 @@ class State:
                 "legs": {
                     n: {
                         "label": leg.cfg["label"],
-                        "dep": leg.cfg["dep"],
-                        "arr": leg.cfg["arr"],
+                        "dep": leg_route(leg.cfg)["dep"],
+                        "arr": leg_route(leg.cfg)["arr"],
                         "date": leg.cfg["date"],
                         "time_start": leg.cfg["time_start"],
                         "time_end": leg.cfg["time_end"],
@@ -278,10 +322,11 @@ def send_email(subject: str, body: str) -> tuple[bool, str]:
 def notify_booking(leg: LegState, reserve_obj) -> None:
     train = leg.candidates  # not used; we already have train info via result
     cfg = leg.cfg
+    route = leg_route(cfg)
     subject = f"[SRT] {cfg['label']} 예매 완료 — 10분 내 결제 필요"
     body = (
         f"SRT 자동 예매가 잡혔습니다. 10분 내 SRT 앱에서 결제하세요.\n\n"
-        f"구간       : {cfg['dep']} → {cfg['arr']}\n"
+        f"구간       : {route['dep']} → {route['arr']}\n"
         f"일자       : {cfg['date']}\n"
         f"인원       : 성인 {cfg['adults']}명\n"
         f"잡힌 시각  : {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
@@ -302,10 +347,11 @@ def notify_booking(leg: LegState, reserve_obj) -> None:
 def try_leg(srt: SRT, leg: LegState) -> bool:
     """Returns True 이면 leg 종료(예매 성공)."""
     cfg = leg.cfg
+    route = leg_route(cfg)
     leg.attempts += 1
     try:
         trains = srt.search_train(
-            cfg["dep"], cfg["arr"],
+            route["dep"], route["arr"],
             date=cfg["date"], time=cfg["time_start"],
             available_only=False,
         )
@@ -320,7 +366,12 @@ def try_leg(srt: SRT, leg: LegState) -> bool:
     candidates = sorted(
         [t for t in trains if in_window(t, cfg)], key=lambda t: t.dep_time
     )
-    available = [t for t in candidates if t.seat_available()]
+    general_available = [t for t in candidates if t.general_seat_available()]
+    special_only_available = [
+        t for t in candidates
+        if not t.general_seat_available() and t.special_seat_available()
+    ]
+    available = general_available + special_only_available
     standby_only = [
         t for t in candidates
         if not t.seat_available() and t.reserve_standby_available()
@@ -330,21 +381,25 @@ def try_leg(srt: SRT, leg: LegState) -> bool:
         leg.available_count = len(available)
         leg.standby_count = len(standby_only)
 
+    if leg.attempts % 15 == 1:
+        STATE.log(
+            f"[{leg.name}] 후보 {len(candidates)} / 잔여 {len(available)} / "
+            f"대기가능 {len(standby_only)}"
+        )
+
     passengers = [Adult(cfg["adults"])]
 
-    for t in available:
+    for t, seat_label, seat_type in [
+        *[(t, "일반석", SeatType.GENERAL_ONLY) for t in general_available],
+        *[(t, "특실", SeatType.SPECIAL_ONLY) for t in special_only_available],
+    ]:
         STATE.log(
-            f"[{leg.name}] 예매 시도 {t.dep_time[:2]}:{t.dep_time[2:4]} "
+            f"[{leg.name}] {seat_label} 예매 시도 {t.dep_time[:2]}:{t.dep_time[2:4]} "
             f"{t.train_number}"
         )
         try:
-            r = srt.reserve(t, passengers=passengers)
-            leg.result = {
-                "type": "reserve",
-                "summary": str(r),
-                "train": serialize_train(t),
-                "captured_at": datetime.now().isoformat(timespec="seconds"),
-            }
+            r = srt.reserve(t, passengers=passengers, special_seat=seat_type)
+            leg.result = reservation_result("reserve", r, t, datetime.now())
             STATE.log(f"[{leg.name}] [SUCCESS] 예매 완료")
             notify_booking(leg, r)
             return True
@@ -358,13 +413,10 @@ def try_leg(srt: SRT, leg: LegState) -> bool:
                 f"{t.train_number}"
             )
             try:
-                r = srt.reserve_standby(t, passengers=passengers)
-                leg.result = {
-                    "type": "standby",
-                    "summary": str(r),
-                    "train": serialize_train(t),
-                    "captured_at": datetime.now().isoformat(timespec="seconds"),
-                }
+                r = srt.reserve_standby(
+                    t, passengers=passengers, special_seat=SeatType.GENERAL_FIRST
+                )
+                leg.result = reservation_result("standby", r, t, datetime.now())
                 STATE.log(f"[{leg.name}] [STANDBY] 예약대기 등록")
                 notify_booking(leg, r)
                 return True
@@ -372,6 +424,74 @@ def try_leg(srt: SRT, leg: LegState) -> bool:
                 STATE.log(f"[{leg.name}]   대기 실패: {e}")
 
     return False
+
+
+def paid_reservation_numbers(srt: SRT) -> set[str]:
+    return {
+        str(r.reservation_number)
+        for r in srt.get_reservations(paid_only=True)
+        if getattr(r, "reservation_number", None)
+    }
+
+
+def refresh_booking_results(srt: SRT) -> None:
+    now = datetime.now()
+    due_legs: list[LegState] = []
+    with STATE.lock:
+        for leg in STATE.legs.values():
+            result = leg.result
+            if not result or result.get("type") != "reserve" or result.get("paid"):
+                continue
+
+            retry_after = parse_iso_datetime(result.get("retry_after_at"))
+            if retry_after is None:
+                retry_after = retry_at_from(
+                    parse_iso_datetime(result.get("captured_at")) or now
+                )
+                result["retry_after_at"] = retry_after.isoformat(timespec="seconds")
+
+            if now >= retry_after:
+                due_legs.append(leg)
+
+    if not due_legs:
+        return
+
+    try:
+        paid_numbers = paid_reservation_numbers(srt)
+    except SRTError as e:
+        paid_numbers = set()
+        STATE.last_error = f"payment check: {e}"
+        STATE.log(f"결제 확인 실패: {e} — 미결제로 보고 감시 재개")
+
+    for leg in due_legs:
+        paid_confirmed = False
+        with STATE.lock:
+            result = leg.result
+            if not result:
+                continue
+            reservation_number = result.get("reservation_number")
+            if reservation_number and str(reservation_number) in paid_numbers:
+                result["paid"] = True
+                result["payment_checked_at"] = datetime.now().isoformat(
+                    timespec="seconds"
+                )
+                paid_confirmed = True
+            else:
+                leg.result = None
+                leg.available_count = 0
+                leg.standby_count = 0
+
+        if paid_confirmed:
+            STATE.log(f"[{leg.name}] 결제 완료 확인 — 해당 구간 감시 종료 유지")
+            continue
+
+        STATE.log(f"[{leg.name}] 10분 내 결제 미확인 — 다시 감시 시작")
+
+
+def leg_is_final(leg: LegState) -> bool:
+    if not leg.result:
+        return False
+    return leg.result.get("type") == "standby" or bool(leg.result.get("paid"))
 
 
 def worker_loop() -> None:
@@ -411,11 +531,19 @@ def worker_loop() -> None:
         )
 
     while not STOP.is_set():
+        refresh_booking_results(srt)
         pending_legs = [leg for leg in STATE.legs.values() if leg.result is None]
         if not pending_legs:
-            STATE.worker_status = "done"
-            STATE.log("모든 leg 예매 완료 — 워커 종료")
-            return
+            if all(leg_is_final(leg) for leg in STATE.legs.values()):
+                STATE.worker_status = "done"
+                STATE.log("모든 leg 처리 완료 — 워커 종료")
+                return
+
+            STATE.worker_status = "waiting_payment"
+            time.sleep(min(INTERVAL, 10))
+            continue
+
+        STATE.worker_status = "running"
 
         for leg in pending_legs:
             if STOP.is_set():
