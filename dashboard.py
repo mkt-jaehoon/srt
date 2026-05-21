@@ -73,6 +73,9 @@ INTERVAL = float(os.getenv("SRT_INTERVAL", "4"))
 STANDBY = os.getenv("SRT_STANDBY", "0") == "1"
 PORT = int(os.getenv("DASH_PORT", "8765"))
 BOOKING_RETRY_AFTER_SECONDS = int(os.getenv("SRT_BOOKING_RETRY_AFTER_SECONDS", "600"))
+PAYMENT_CHECK_START_SECONDS = int(os.getenv("SRT_PAYMENT_CHECK_START_SECONDS", "570"))
+PAYMENT_CHECK_RETRY_SECONDS = int(os.getenv("SRT_PAYMENT_CHECK_RETRY_SECONDS", "15"))
+PAYMENT_CHECK_MAX_ATTEMPTS = int(os.getenv("SRT_PAYMENT_CHECK_MAX_ATTEMPTS", "3"))
 TIME_OPTIONS_PATH = Path(os.getenv("SRT_TIME_OPTIONS_PATH", "time_options.json"))
 TIME_OPTIONS_ROUTE = {"dep": "수서", "arr": "부산"}
 
@@ -166,6 +169,10 @@ def retry_at_from(captured_at: datetime) -> datetime:
     return captured_at + timedelta(seconds=BOOKING_RETRY_AFTER_SECONDS)
 
 
+def payment_check_start_at_from(captured_at: datetime) -> datetime:
+    return captured_at + timedelta(seconds=PAYMENT_CHECK_START_SECONDS)
+
+
 def parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -192,6 +199,15 @@ def reservation_result(
         "paid": bool(getattr(reserve_obj, "paid", False)),
         "train": serialize_train(train),
         "captured_at": captured_at.isoformat(timespec="seconds"),
+        "payment_status": "waiting",
+        "payment_check_attempts": 0,
+        "payment_check_max_attempts": PAYMENT_CHECK_MAX_ATTEMPTS,
+        "payment_check_start_at": payment_check_start_at_from(captured_at).isoformat(
+            timespec="seconds"
+        ),
+        "next_payment_check_at": payment_check_start_at_from(captured_at).isoformat(
+            timespec="seconds"
+        ),
         "retry_after_at": retry_at_from(captured_at).isoformat(timespec="seconds"),
     }
 
@@ -450,7 +466,15 @@ def refresh_booking_results(srt: SRT) -> None:
                 )
                 result["retry_after_at"] = retry_after.isoformat(timespec="seconds")
 
-            if now >= retry_after:
+            next_check = parse_iso_datetime(result.get("next_payment_check_at"))
+            if next_check is None:
+                captured_at = parse_iso_datetime(result.get("captured_at")) or now
+                next_check = payment_check_start_at_from(captured_at)
+                result["next_payment_check_at"] = next_check.isoformat(
+                    timespec="seconds"
+                )
+
+            if now >= next_check:
                 due_legs.append(leg)
 
     if not due_legs:
@@ -459,33 +483,75 @@ def refresh_booking_results(srt: SRT) -> None:
     try:
         paid_numbers = paid_reservation_numbers(srt)
     except SRTError as e:
-        paid_numbers = set()
+        paid_numbers = None
         STATE.last_error = f"payment check: {e}"
-        STATE.log(f"결제 확인 실패: {e} — 미결제로 보고 감시 재개")
+        STATE.log(f"결제 확인 실패: {e} — 재확인 예정")
 
     for leg in due_legs:
         paid_confirmed = False
+        should_retry = False
+        should_resume = False
+        attempt_count = 0
+        max_attempts = PAYMENT_CHECK_MAX_ATTEMPTS
         with STATE.lock:
             result = leg.result
             if not result:
                 continue
             reservation_number = result.get("reservation_number")
-            if reservation_number and str(reservation_number) in paid_numbers:
+            result["payment_status"] = "checking"
+            attempt_count = int(result.get("payment_check_attempts") or 0) + 1
+            max_attempts = int(
+                result.get("payment_check_max_attempts") or PAYMENT_CHECK_MAX_ATTEMPTS
+            )
+            result["payment_check_attempts"] = attempt_count
+            result["payment_checked_at"] = datetime.now().isoformat(timespec="seconds")
+
+            if (
+                paid_numbers is not None
+                and reservation_number
+                and str(reservation_number) in paid_numbers
+            ):
                 result["paid"] = True
+                result["payment_status"] = "paid"
                 result["payment_checked_at"] = datetime.now().isoformat(
                     timespec="seconds"
                 )
                 paid_confirmed = True
             else:
-                leg.result = None
-                leg.available_count = 0
-                leg.standby_count = 0
+                retry_after = parse_iso_datetime(result.get("retry_after_at")) or now
+                if attempt_count < max_attempts:
+                    next_check = min(
+                        now + timedelta(seconds=PAYMENT_CHECK_RETRY_SECONDS),
+                        retry_after,
+                    )
+                    result["payment_status"] = "waiting"
+                    result["next_payment_check_at"] = next_check.isoformat(
+                        timespec="seconds"
+                    )
+                    should_retry = True
+                else:
+                    result["payment_status"] = "unpaid"
+                    leg.result = None
+                    leg.available_count = 0
+                    leg.standby_count = 0
+                    should_resume = True
 
         if paid_confirmed:
             STATE.log(f"[{leg.name}] 결제 완료 확인 — 해당 구간 감시 종료 유지")
             continue
 
-        STATE.log(f"[{leg.name}] 10분 내 결제 미확인 — 다시 감시 시작")
+        if should_retry:
+            STATE.log(
+                f"[{leg.name}] 결제 미확인 — "
+                f"{attempt_count}/{max_attempts}회 확인, 재확인 예정"
+            )
+            continue
+
+        if should_resume:
+            STATE.log(
+                f"[{leg.name}] 결제 미확인 — "
+                f"{attempt_count}/{max_attempts}회 확인 후 다시 감시 시작"
+            )
 
 
 def leg_is_final(leg: LegState) -> bool:
@@ -983,6 +1049,27 @@ HTML = """<!doctype html>
     </div>
 
     <script>
+        function formatTime(value) {
+            if (!value) return '-';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return '-';
+            return date.toLocaleTimeString();
+        }
+
+        function secondsUntil(value) {
+            if (!value) return null;
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return null;
+            return Math.max(0, Math.floor((date.getTime() - Date.now()) / 1000));
+        }
+
+        function formatRemaining(seconds) {
+            if (seconds === null) return '-';
+            const m = String(Math.floor(seconds / 60)).padStart(2, '0');
+            const s = String(seconds % 60).padStart(2, '0');
+            return `${m}:${s}`;
+        }
+
         async function updateDashboard() {
             try {
                 const response = await fetch('/api/state');
@@ -1022,10 +1109,33 @@ HTML = """<!doctype html>
                     let resultHtml = '';
                     if (leg.result) {
                         const isStandby = leg.result.type === 'standby';
+                        const isPaid = leg.result.paid === true || leg.result.payment_status === 'paid';
+                        const isChecking = leg.result.payment_status === 'checking';
+                        const retryRemaining = formatRemaining(secondsUntil(leg.result.retry_after_at));
+                        const nextCheckRemaining = formatRemaining(secondsUntil(leg.result.next_payment_check_at));
+                        const checkAttempts = leg.result.payment_check_attempts || 0;
+                        const maxAttempts = leg.result.payment_check_max_attempts || 3;
+                        const statusText = isStandby
+                            ? '예약대기 등록됨'
+                            : isPaid
+                                ? '결제 확인됨'
+                                : isChecking
+                                    ? '결제 확인 중'
+                                    : '결제 대기';
+                        const statusBadge = isStandby
+                            ? '예약대기'
+                            : isPaid
+                                ? '결제 완료'
+                                : `결제 확인 ${checkAttempts}/${maxAttempts}`;
+                        const paymentLine = isStandby
+                            ? '예약대기 등록 상태입니다.'
+                            : isPaid
+                                ? `결제 확인 시각: ${formatTime(leg.result.payment_checked_at)}`
+                                : `다음 결제 확인: ${formatTime(leg.result.next_payment_check_at)} (${nextCheckRemaining}) · 미확인 시 재감시: ${formatTime(leg.result.retry_after_at)} (${retryRemaining})`;
                         resultHtml = `
                             <div class="result-banner ${isStandby ? 'standby' : ''}">
                                 <div class="result-header">
-                                    <span>${isStandby ? '⏳ 예약대기 등록됨' : '✅ 예매 완료'}</span>
+                                    <span>${statusText}</span>
                                     <span style="font-weight: 400; font-size: 0.875rem; color: var(--text-muted); margin-left: auto;">
                                         ${leg.result.captured_at.slice(11, 19)}
                                     </span>
@@ -1034,7 +1144,10 @@ HTML = """<!doctype html>
                                     ${leg.result.train.dep_time} ${leg.result.train.dep} → ${leg.result.train.arr} (${leg.result.train.train_number})
                                 </div>
                                 <div style="font-size: 0.8125rem; color: var(--secondary); margin-top: 0.25rem;">
-                                    10분 이내에 SRT 앱에서 결제를 완료해야 합니다.
+                                    ${statusBadge} · 예약번호 ${leg.result.reservation_number || '-'} · 결제기한 ${leg.result.payment_deadline || '-'}
+                                </div>
+                                <div style="font-size: 0.8125rem; color: var(--secondary);">
+                                    ${paymentLine}
                                 </div>
                             </div>
                         `;
