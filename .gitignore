@@ -11,6 +11,8 @@ wheels/
 
 # Secrets
 .env
+*.env
+*:Zone.Identifier
 
 # Local runtime options
 time_options.json
