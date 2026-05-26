@@ -19,3 +19,7 @@ time_options.json
 
 # Local agent state
 .omc/
+watches.json
+settings.json
+users.json
+.session_secret

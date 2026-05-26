@@ -21,9 +21,13 @@ ENV (.env):
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
 import smtplib
 import threading
 import time
@@ -36,8 +40,8 @@ from uuid import uuid4
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from SRT import SRT
 from SRT.errors import SRTError, SRTLoginError, SRTResponseError
@@ -140,6 +144,10 @@ RESERVATION_CACHE_TTL_SECONDS = int(os.getenv("SRT_RESERVATION_CACHE_TTL", "30")
 SAME_DAY_BUFFER_MINUTES = int(os.getenv("SRT_SAME_DAY_BUFFER_MINUTES", "10"))
 TIME_OPTIONS_PATH = Path(os.getenv("SRT_TIME_OPTIONS_PATH", "time_options.json"))
 SETTINGS_PATH = Path(os.getenv("SRT_SETTINGS_PATH", "settings.json"))
+USERS_PATH = Path(os.getenv("SRT_USERS_PATH", "users.json"))
+SESSION_SECRET_PATH = Path(os.getenv("SRT_SESSION_SECRET_PATH", ".session_secret"))
+SESSION_COOKIE_NAME = os.getenv("SRT_SESSION_COOKIE", "srt_session")
+SESSION_TTL_DAYS = int(os.getenv("SRT_SESSION_TTL_DAYS", "30"))
 TIME_OPTIONS_ROUTE = {"dep": "수서", "arr": "부산"}
 
 
@@ -539,33 +547,210 @@ def _parse_emails(raw: str) -> list[str]:
     return [e.strip() for e in raw.split(",") if e.strip()]
 
 
-def _default_settings() -> dict[str, Any]:
-    env_emails = _parse_emails(os.getenv("NOTIFY_EMAIL", ""))
-    return {"schema_version": 1, "notify_emails": env_emails}
+# --- 사용자 관리 (개별 로그인 + 개별 이메일) ---
+
+_USERS_LOCK = threading.Lock()
 
 
-def load_settings() -> dict[str, Any]:
-    if not SETTINGS_PATH.exists():
-        s = _default_settings()
-        save_settings(s)
-        return s
+def _hash_password(password: str, salt: str | None = None) -> str:
+    """sha256 기반 솔트 해시. 형식: 'sha256$<salt>$<hex>'"""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    digest = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return f"sha256${salt}${digest}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
     try:
-        with SETTINGS_PATH.open("r", encoding="utf-8") as f:
-            raw = json.load(f)
+        scheme, salt, _ = stored.split("$", 2)
+    except ValueError:
+        return False
+    if scheme != "sha256":
+        return False
+    expected = _hash_password(password, salt)
+    return hmac.compare_digest(expected, stored)
+
+
+def _seed_users() -> list[dict[str, Any]]:
+    """초기 시드: .env 의 ADMIN_USERNAME/ADMIN_PASSWORD 또는 기본 admin/admin."""
+    username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
+    password = os.getenv("ADMIN_PASSWORD", "admin").strip() or "admin"
+    email = os.getenv("NOTIFY_EMAIL", "").split(",")[0].strip()
+    return [{
+        "id": uuid4().hex[:8],
+        "username": username,
+        "password_hash": _hash_password(password),
+        "email": email,
+        "notify_enabled": bool(email),
+        "is_admin": True,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }]
+
+
+def load_users() -> list[dict[str, Any]]:
+    if not USERS_PATH.exists():
+        users = _seed_users()
+        save_users(users)
+        return users
+    try:
+        with USERS_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return _default_settings()
+        return _seed_users()
+    if isinstance(data, dict):
+        data = data.get("users") or []
+    if not isinstance(data, list):
+        return _seed_users()
+    out: list[dict[str, Any]] = []
+    for u in data:
+        if not isinstance(u, dict):
+            continue
+        if not u.get("username") or not u.get("password_hash"):
+            continue
+        out.append({
+            "id": str(u.get("id") or uuid4().hex[:8]),
+            "username": str(u["username"]).strip(),
+            "password_hash": str(u["password_hash"]),
+            "email": str(u.get("email") or "").strip(),
+            "notify_enabled": bool(u.get("notify_enabled", True)),
+            "is_admin": bool(u.get("is_admin", False)),
+            "created_at": u.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+        })
+    if not out:
+        return _seed_users()
+    return out
+
+
+def save_users(users: list[dict[str, Any]]) -> None:
+    with _USERS_LOCK:
+        _atomic_write_json(USERS_PATH, users)
+
+
+def find_user_by_username(username: str) -> dict[str, Any] | None:
+    username = (username or "").strip().lower()
+    for u in load_users():
+        if u["username"].lower() == username:
+            return u
+    return None
+
+
+def find_user_by_id(user_id: str) -> dict[str, Any] | None:
+    for u in load_users():
+        if u["id"] == user_id:
+            return u
+    return None
+
+
+def public_user(u: dict[str, Any]) -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "notify_emails": [e for e in (raw.get("notify_emails") or []) if isinstance(e, str) and "@" in e],
+        "id": u["id"],
+        "username": u["username"],
+        "email": u.get("email", ""),
+        "notify_enabled": bool(u.get("notify_enabled", True)),
+        "is_admin": bool(u.get("is_admin", False)),
+        "created_at": u.get("created_at"),
     }
 
 
-def save_settings(s: dict[str, Any]) -> None:
-    _atomic_write_json(SETTINGS_PATH, s)
+# --- 세션 토큰 (HMAC-서명) ---
+
+def _load_or_create_session_secret() -> bytes:
+    env_secret = os.getenv("SRT_SESSION_SECRET")
+    if env_secret:
+        return env_secret.encode("utf-8")
+    if SESSION_SECRET_PATH.exists():
+        try:
+            return SESSION_SECRET_PATH.read_bytes().strip() or secrets.token_bytes(32)
+        except OSError:
+            pass
+    secret = secrets.token_hex(32).encode("utf-8")
+    try:
+        SESSION_SECRET_PATH.write_bytes(secret)
+        try:
+            os.chmod(SESSION_SECRET_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    return secret
+
+
+_SESSION_SECRET = _load_or_create_session_secret()
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def create_session_token(user_id: str) -> str:
+    payload = {
+        "uid": user_id,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + SESSION_TTL_DAYS * 86400,
+    }
+    body = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sig = hmac.new(_SESSION_SECRET, body.encode("ascii"), hashlib.sha256).digest()
+    return f"{body}.{_b64url_encode(sig)}"
+
+
+def verify_session_token(token: str | None) -> dict[str, Any] | None:
+    if not token or "." not in token:
+        return None
+    try:
+        body, sig = token.split(".", 1)
+        expected = hmac.new(_SESSION_SECRET, body.encode("ascii"), hashlib.sha256).digest()
+        if not hmac.compare_digest(_b64url_decode(sig), expected):
+            return None
+        payload = json.loads(_b64url_decode(body))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    return payload
+
+
+def current_user(request: Request) -> dict[str, Any]:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    payload = verify_session_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="login required")
+    user = find_user_by_id(str(payload.get("uid") or ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="user not found")
+    return user
+
+
+def current_user_optional(request: Request) -> dict[str, Any] | None:
+    try:
+        return current_user(request)
+    except HTTPException:
+        return None
+
+
+# --- 기존 settings(공용) 호환 유지: 알림 이메일은 users.json 기반 ---
+
+
+def load_settings() -> dict[str, Any]:
+    return {"schema_version": 1, "notify_emails": get_notify_emails()}
 
 
 def get_notify_emails() -> list[str]:
-    return list(load_settings().get("notify_emails") or [])
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in load_users():
+        if not u.get("notify_enabled"):
+            continue
+        email = (u.get("email") or "").strip()
+        if not email or "@" not in email or email in seen:
+            continue
+        seen.add(email)
+        out.append(email)
+    return out
 
 
 class LegState:
@@ -1204,13 +1389,183 @@ def worker_loop() -> None:
 app = FastAPI(title="SRT 왕복 자동 예매")
 
 
+# --- 인증 라우트 (공개) ---
+
+ALLOW_SIGNUP = os.getenv("SRT_ALLOW_SIGNUP", "1") == "1"
+
+
+def _set_session_cookie(resp: JSONResponse, token: str) -> None:
+    resp.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=SESSION_TTL_DAYS * 86400,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+
+
+@app.post("/api/login")
+def api_login(payload: dict[str, Any]) -> JSONResponse:
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username/password required")
+    user = find_user_by_username(username)
+    if not user or not _verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 올바르지 않습니다")
+    token = create_session_token(user["id"])
+    resp = JSONResponse({"ok": True, "user": public_user(user)})
+    _set_session_cookie(resp, token)
+    STATE.log(f"로그인: {user['username']}")
+    return resp
+
+
+@app.post("/api/logout")
+def api_logout(request: Request) -> JSONResponse:
+    u = current_user_optional(request)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    if u:
+        STATE.log(f"로그아웃: {u['username']}")
+    return resp
+
+
+@app.post("/api/signup")
+def api_signup(payload: dict[str, Any]) -> JSONResponse:
+    if not ALLOW_SIGNUP:
+        raise HTTPException(status_code=403, detail="signup disabled")
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    email = str(payload.get("email") or "").strip()
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username/password required")
+    if len(password) < 4:
+        raise HTTPException(status_code=400, detail="비밀번호는 4자 이상")
+    if email and "@" not in email:
+        raise HTTPException(status_code=400, detail="이메일 형식이 올바르지 않습니다")
+    if find_user_by_username(username):
+        raise HTTPException(status_code=409, detail="이미 사용 중인 아이디")
+
+    users = load_users()
+    new_user = {
+        "id": uuid4().hex[:8],
+        "username": username,
+        "password_hash": _hash_password(password),
+        "email": email,
+        "notify_enabled": bool(email),
+        "is_admin": False,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    users.append(new_user)
+    try:
+        save_users(users)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    token = create_session_token(new_user["id"])
+    resp = JSONResponse({"ok": True, "user": public_user(new_user)})
+    _set_session_cookie(resp, token)
+    STATE.log(f"신규 가입: {new_user['username']}")
+    return resp
+
+
+@app.get("/api/me")
+def api_me(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
+    return JSONResponse({"user": public_user(user)})
+
+
+@app.patch("/api/me")
+def api_update_me(
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
+    users = load_users()
+    target = next((u for u in users if u["id"] == user["id"]), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    changed: list[str] = []
+
+    if "email" in payload:
+        new_email = str(payload.get("email") or "").strip()
+        if new_email and "@" not in new_email:
+            raise HTTPException(status_code=400, detail="이메일 형식이 올바르지 않습니다")
+        if new_email != target.get("email", ""):
+            target["email"] = new_email
+            if not new_email:
+                target["notify_enabled"] = False
+            changed.append(f"email={new_email or '(없음)'}")
+
+    if "notify_enabled" in payload:
+        val = bool(payload.get("notify_enabled"))
+        if val and not target.get("email"):
+            raise HTTPException(status_code=400, detail="이메일을 먼저 등록하세요")
+        if val != bool(target.get("notify_enabled")):
+            target["notify_enabled"] = val
+            changed.append(f"notify={val}")
+
+    if "password" in payload:
+        new_pw = str(payload.get("password") or "")
+        current_pw = str(payload.get("current_password") or "")
+        if len(new_pw) < 4:
+            raise HTTPException(status_code=400, detail="비밀번호는 4자 이상")
+        if not _verify_password(current_pw, target["password_hash"]):
+            raise HTTPException(status_code=403, detail="현재 비밀번호가 올바르지 않습니다")
+        target["password_hash"] = _hash_password(new_pw)
+        changed.append("password")
+
+    if changed:
+        try:
+            save_users(users)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        STATE.log(f"사용자 수정 [{target['username']}]: {', '.join(changed)}")
+
+    return JSONResponse({"ok": True, "user": public_user(target)})
+
+
+@app.get("/api/users")
+def api_list_users(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+    return JSONResponse({"users": [public_user(u) for u in load_users()]})
+
+
+@app.delete("/api/users/{user_id}")
+def api_delete_user(
+    user_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+    if user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="자기 자신은 삭제 불가")
+    users = load_users()
+    target = next((u for u in users if u["id"] == user_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    new_users = [u for u in users if u["id"] != user_id]
+    try:
+        save_users(new_users)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    STATE.log(f"사용자 삭제: {target['username']}")
+    return JSONResponse({"ok": True, "removed_id": user_id})
+
+
+# --- 보호된 라우트 ---
+
+
 @app.get("/api/state")
-def api_state() -> JSONResponse:
-    return JSONResponse(STATE.snapshot())
+def api_state(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
+    snap = STATE.snapshot()
+    snap["me"] = public_user(user)
+    return JSONResponse(snap)
 
 
 @app.post("/api/test-email")
-def api_test_email() -> JSONResponse:
+def api_test_email(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
     ok, info = send_email(
         subject="[SRT] 알림 테스트",
         body=f"이 메일이 보이면 SMTP 설정 OK.\n시각: {datetime.now():%Y-%m-%d %H:%M:%S}\n",
@@ -1219,46 +1574,20 @@ def api_test_email() -> JSONResponse:
 
 
 @app.get("/api/settings")
-def api_get_settings() -> JSONResponse:
+def api_get_settings(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
     return JSONResponse(load_settings())
 
 
-@app.patch("/api/settings")
-def api_update_settings(payload: dict[str, Any]) -> JSONResponse:
-    current = load_settings()
-    raw = payload.get("notify_emails")
-    if raw is None:
-        raise HTTPException(status_code=400, detail="notify_emails required")
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=400, detail="notify_emails must be a list")
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for e in raw:
-        if not isinstance(e, str):
-            continue
-        e = e.strip()
-        if not e or "@" not in e:
-            continue
-        if e in seen:
-            continue
-        seen.add(e)
-        cleaned.append(e)
-    current["notify_emails"] = cleaned
-    try:
-        save_settings(current)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    STATE.log(f"알림 이메일 변경: {len(cleaned)}명 — {', '.join(cleaned) or '(없음)'}")
-    return JSONResponse({"ok": True, "settings": current})
-
-
 @app.get("/api/watches")
-def api_list_watches() -> JSONResponse:
+def api_list_watches(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
     return JSONResponse({"watches": load_watches(), "stations": SRT_STATIONS})
 
 
 @app.post("/api/watches")
-def api_create_watch(payload: dict[str, Any]) -> JSONResponse:
+def api_create_watch(
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
     try:
         item = normalize_watch(payload)
     except ValueError as exc:
@@ -1280,7 +1609,11 @@ def api_create_watch(payload: dict[str, Any]) -> JSONResponse:
 
 
 @app.patch("/api/watches/{watch_id}")
-def api_update_watch(watch_id: str, payload: dict[str, Any]) -> JSONResponse:
+def api_update_watch(
+    watch_id: str,
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
     watches = load_watches()
     target = find_watch(watches, watch_id)
     if target is None:
@@ -1312,7 +1645,10 @@ def api_update_watch(watch_id: str, payload: dict[str, Any]) -> JSONResponse:
 
 
 @app.delete("/api/watches/{watch_id}")
-def api_delete_watch(watch_id: str) -> JSONResponse:
+def api_delete_watch(
+    watch_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
     watches = load_watches()
     target = find_watch(watches, watch_id)
     if target is None:
@@ -1330,7 +1666,10 @@ def api_delete_watch(watch_id: str) -> JSONResponse:
 
 
 @app.post("/api/watches/{watch_id}/reset")
-def api_reset_watch(watch_id: str) -> JSONResponse:
+def api_reset_watch(
+    watch_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
     """예매 결과를 초기화해서 다시 감시 상태로 돌림."""
     watches = load_watches()
     target = find_watch(watches, watch_id)
@@ -1356,7 +1695,7 @@ def api_reset_watch(watch_id: str) -> JSONResponse:
 
 
 @app.get("/api/time-options")
-def api_time_options() -> JSONResponse:
+def api_time_options(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
     """수서→부산 시간대 옵션 껍데기. 현재 워커에는 적용하지 않는다."""
     return JSONResponse(
         {
@@ -1368,7 +1707,10 @@ def api_time_options() -> JSONResponse:
 
 
 @app.post("/api/time-options/windows")
-def api_add_time_option_window(window: dict[str, Any]) -> JSONResponse:
+def api_add_time_option_window(
+    window: dict[str, Any],
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
     """시간대 옵션 추가. 저장만 하고 현재 실행 중인 예매 조건에는 반영하지 않는다."""
     try:
         item = normalize_time_window(window)
@@ -1393,7 +1735,10 @@ def api_add_time_option_window(window: dict[str, Any]) -> JSONResponse:
 
 
 @app.delete("/api/time-options/windows/{window_id}")
-def api_delete_time_option_window(window_id: str) -> JSONResponse:
+def api_delete_time_option_window(
+    window_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
     """시간대 옵션 삭제. 저장만 하고 현재 실행 중인 예매 조건에는 반영하지 않는다."""
     try:
         config = load_time_options()
@@ -1418,6 +1763,144 @@ def api_delete_time_option_window(window_id: str) -> JSONResponse:
             "config": config,
         }
     )
+
+
+LOGIN_HTML = """<!doctype html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SRT 로그인</title>
+    <style>
+        :root { --primary: #1f2d5a; --border: #e5e7eb; --bg: #f6f7f9; --text: #1f2937; --muted: #6b7280; --error: #b91c1c; --success: #047857; }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Pretendard", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+        .wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem; }
+        .card { width: 100%; max-width: 380px; background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 2rem; box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08); }
+        h1 { font-size: 1.25rem; margin: 0 0 0.25rem; color: var(--primary); }
+        .sub { font-size: 0.85rem; color: var(--muted); margin: 0 0 1.5rem; }
+        .tabs { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; border-bottom: 1px solid var(--border); }
+        .tab { flex: 1; padding: 0.6rem; background: none; border: none; border-bottom: 2px solid transparent; cursor: pointer; font-size: 0.9rem; color: var(--muted); font-weight: 600; }
+        .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+        form { display: flex; flex-direction: column; gap: 0.75rem; }
+        label { font-size: 0.8rem; color: var(--muted); display: flex; flex-direction: column; gap: 0.25rem; }
+        input { padding: 0.6rem 0.75rem; border: 1px solid var(--border); border-radius: 8px; font-size: 0.95rem; font-family: inherit; }
+        input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(31,45,90,0.12); }
+        button.submit { margin-top: 0.5rem; padding: 0.7rem; background: var(--primary); color: #fff; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.95rem; }
+        button.submit:hover { background: #16224a; }
+        button.submit:disabled { opacity: 0.6; cursor: not-allowed; }
+        .msg { font-size: 0.85rem; min-height: 1.2em; margin-top: 0.25rem; }
+        .msg.error { color: var(--error); }
+        .msg.success { color: var(--success); }
+        .foot { font-size: 0.75rem; color: var(--muted); margin-top: 1.25rem; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="card">
+            <h1>SRT Smart Booking</h1>
+            <p class="sub">팀 공용 대시보드 · 개별 계정으로 로그인</p>
+            <div class="tabs">
+                <button class="tab active" id="tab-login" onclick="switchTab('login')">로그인</button>
+                <button class="tab" id="tab-signup" onclick="switchTab('signup')">가입</button>
+            </div>
+
+            <form id="form-login" onsubmit="return doLogin(event)">
+                <label>아이디 <input type="text" name="username" autocomplete="username" required></label>
+                <label>비밀번호 <input type="password" name="password" autocomplete="current-password" required></label>
+                <div class="msg" id="login-msg"></div>
+                <button type="submit" class="submit">로그인</button>
+            </form>
+
+            <form id="form-signup" onsubmit="return doSignup(event)" hidden>
+                <label>아이디 <input type="text" name="username" autocomplete="username" required minlength="2"></label>
+                <label>비밀번호 (4자 이상) <input type="password" name="password" autocomplete="new-password" required minlength="4"></label>
+                <label>알림 받을 이메일 (선택) <input type="email" name="email" autocomplete="email" placeholder="you@example.com"></label>
+                <div class="msg" id="signup-msg"></div>
+                <button type="submit" class="submit">가입하고 로그인</button>
+            </form>
+
+            <div class="foot">팀 11 퍼포먼스 마케팅 · 본 페이지는 사내 전용</div>
+        </div>
+    </div>
+    <script>
+        function switchTab(name) {
+            document.getElementById('tab-login').classList.toggle('active', name === 'login');
+            document.getElementById('tab-signup').classList.toggle('active', name === 'signup');
+            document.getElementById('form-login').hidden = name !== 'login';
+            document.getElementById('form-signup').hidden = name !== 'signup';
+        }
+
+        async function postJSON(url, body) {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                credentials: 'same-origin',
+                body: JSON.stringify(body),
+            });
+            let data = null;
+            try { data = await res.json(); } catch (_) {}
+            return { ok: res.ok, status: res.status, data };
+        }
+
+        async function doLogin(ev) {
+            ev.preventDefault();
+            const form = ev.target;
+            const msg = document.getElementById('login-msg');
+            const btn = form.querySelector('button');
+            msg.textContent = ''; msg.className = 'msg';
+            btn.disabled = true;
+            try {
+                const r = await postJSON('/api/login', {
+                    username: form.username.value.trim(),
+                    password: form.password.value,
+                });
+                if (!r.ok) {
+                    msg.textContent = (r.data && r.data.detail) || '로그인 실패';
+                    msg.className = 'msg error';
+                    return false;
+                }
+                window.location.href = '/';
+            } catch (e) {
+                msg.textContent = '네트워크 오류: ' + e;
+                msg.className = 'msg error';
+            } finally {
+                btn.disabled = false;
+            }
+            return false;
+        }
+
+        async function doSignup(ev) {
+            ev.preventDefault();
+            const form = ev.target;
+            const msg = document.getElementById('signup-msg');
+            const btn = form.querySelector('button');
+            msg.textContent = ''; msg.className = 'msg';
+            btn.disabled = true;
+            try {
+                const r = await postJSON('/api/signup', {
+                    username: form.username.value.trim(),
+                    password: form.password.value,
+                    email: form.email.value.trim(),
+                });
+                if (!r.ok) {
+                    msg.textContent = (r.data && r.data.detail) || '가입 실패';
+                    msg.className = 'msg error';
+                    return false;
+                }
+                window.location.href = '/';
+            } catch (e) {
+                msg.textContent = '네트워크 오류: ' + e;
+                msg.className = 'msg error';
+            } finally {
+                btn.disabled = false;
+            }
+            return false;
+        }
+    </script>
+</body>
+</html>
+"""
 
 
 HTML = """<!doctype html>
@@ -2163,7 +2646,10 @@ HTML = """<!doctype html>
                 <div class="header-info" id="global-status">연결 중...</div>
             </div>
             <div class="hero-actions">
+                <span id="me-info" class="hero-meta" style="font-size: 0.85rem;"></span>
                 <button class="btn" onclick="testEmail()">알림 테스트</button>
+                <button class="btn" onclick="openMyAccount()">내 계정</button>
+                <button class="btn" onclick="doLogout()">로그아웃</button>
                 <span id="email-result" class="hero-meta"></span>
             </div>
         </header>
@@ -2184,9 +2670,9 @@ HTML = """<!doctype html>
                 <div class="value" id="polling-info">-</div>
             </div>
             <div class="status-card notify-card">
-                <h4>알림 대상</h4>
+                <h4>알림 받는 사람</h4>
                 <div class="value" id="notify-info" style="font-size: 0.875rem;">-</div>
-                <button class="btn btn-sm" id="notify-edit-btn" onclick="openNotifyEditor()" style="margin-top: 0.5rem;">수정</button>
+                <button class="btn btn-sm" id="notify-edit-btn" onclick="openMyAccount()" style="margin-top: 0.5rem;">내 이메일 설정</button>
             </div>
         </div>
 
@@ -2299,20 +2785,33 @@ HTML = """<!doctype html>
         </div>
     </div>
 
-    <div class="modal-overlay" id="notify-modal" hidden onclick="closeNotifyEditor(event)" role="dialog" aria-modal="true" aria-labelledby="notify-modal-title">
+    <div class="modal-overlay" id="account-modal" hidden onclick="closeMyAccount(event)" role="dialog" aria-modal="true" aria-labelledby="account-modal-title">
         <div class="modal-card" onclick="event.stopPropagation()">
             <div class="modal-header">
-                <h3 id="notify-modal-title">알림 이메일</h3>
-                <button class="btn btn-sm" onclick="closeNotifyEditor()">닫기</button>
+                <h3 id="account-modal-title">내 계정</h3>
+                <button class="btn btn-sm" onclick="closeMyAccount()">닫기</button>
             </div>
             <div class="modal-body">
-                <p class="modal-help">예매 완료 시 알림을 받을 이메일. 여러 개면 줄바꿈 또는 쉼표로 구분.</p>
-                <textarea id="notify-emails-input" rows="6" placeholder="example@gmail.com&#10;another@example.com"></textarea>
-                <div id="notify-result" class="form-result"></div>
+                <p class="modal-help"><strong id="me-username">-</strong> · 본인 알림 이메일만 관리합니다. 다른 팀원 이메일은 각자 로그인해서 설정.</p>
+                <label style="display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.75rem;">
+                    내 알림 이메일
+                    <input type="email" id="me-email-input" placeholder="you@example.com" style="padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px; font-size: 0.95rem; font-family: inherit;">
+                </label>
+                <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; margin-bottom: 0.75rem;">
+                    <input type="checkbox" id="me-notify-toggle"> 예매 완료 시 알림 받기
+                </label>
+                <details style="margin-top: 0.75rem;">
+                    <summary style="cursor: pointer; font-size: 0.85rem; color: var(--text-muted);">비밀번호 변경</summary>
+                    <div style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem;">
+                        <input type="password" id="me-current-pw" placeholder="현재 비밀번호" style="padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
+                        <input type="password" id="me-new-pw" placeholder="새 비밀번호 (4자 이상)" style="padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
+                    </div>
+                </details>
+                <div id="account-result" class="form-result" style="margin-top: 0.75rem;"></div>
             </div>
             <div class="modal-footer">
-                <button class="btn" onclick="closeNotifyEditor()">취소</button>
-                <button class="btn btn-primary" onclick="saveNotifyEmails()">저장</button>
+                <button class="btn" onclick="closeMyAccount()">취소</button>
+                <button class="btn btn-primary" onclick="saveMyAccount()">저장</button>
             </div>
         </div>
     </div>
@@ -2320,12 +2819,30 @@ HTML = """<!doctype html>
     <script>
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
-                const modal = document.getElementById('notify-modal');
+                const modal = document.getElementById('account-modal');
                 if (modal && !modal.hidden) {
                     modal.hidden = true;
                 }
             }
         });
+
+        async function fetchAuth(url, opts) {
+            opts = opts || {};
+            opts.credentials = 'same-origin';
+            const res = await fetch(url, opts);
+            if (res.status === 401) {
+                window.location.href = '/login';
+                throw new Error('not authenticated');
+            }
+            return res;
+        }
+
+        async function doLogout() {
+            try {
+                await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+            } catch (_) {}
+            window.location.href = '/login';
+        }
 
         function formatDateTimeShort(iso) {
             const d = new Date(iso);
@@ -2360,18 +2877,27 @@ HTML = """<!doctype html>
 
         async function updateDashboard() {
             try {
-                const response = await fetch('/api/state');
+                const response = await fetchAuth('/api/state');
                 const state = await response.json();
-                
+
+                // Me info
+                if (state.me) {
+                    window.__me = state.me;
+                    const tag = state.me.is_admin ? ' (관리자)' : '';
+                    const enabled = state.me.notify_enabled && state.me.email ? '🔔' : '🔕';
+                    const mail = state.me.email || '이메일 미설정';
+                    document.getElementById('me-info').textContent = `${state.me.username}${tag} · ${enabled} ${mail}`;
+                }
+
                 // Update Global Status
                 const globalStatus = document.getElementById('global-status');
                 const lastUpdate = new Date().toLocaleTimeString();
                 globalStatus.innerHTML = `<span class="pulse"></span> 마지막 업데이트: ${lastUpdate} | 시작: ${state.started_at?.slice(11, 19)}`;
 
                 // Update Status Cards
-                document.getElementById('worker-status').innerHTML = 
+                document.getElementById('worker-status').innerHTML =
                     `<span class="badge ${state.worker_status === 'running' ? 'badge-success' : 'badge-warning'}">${state.worker_status.toUpperCase()}</span>`;
-                document.getElementById('login-status').innerHTML = 
+                document.getElementById('login-status').innerHTML =
                     `<span class="badge ${state.login_status === 'ok' ? 'badge-success' : 'badge-danger'}">${state.login_status.toUpperCase()}</span>`;
                 document.getElementById('polling-info').textContent = `${state.interval}초`;
                 document.getElementById('notify-info').textContent = (state.notify_emails || []).join(', ') || '(설정 안 됨)';
@@ -2846,7 +3372,7 @@ HTML = """<!doctype html>
         }
 
         async function createWatch(payload) {
-            const res = await fetch('/api/watches', {
+            const res = await fetchAuth('/api/watches', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload),
@@ -2857,7 +3383,7 @@ HTML = """<!doctype html>
         }
 
         async function patchWatch(id, payload) {
-            const res = await fetch(`/api/watches/${id}`, {
+            const res = await fetchAuth(`/api/watches/${id}`, {
                 method: 'PATCH',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload),
@@ -2925,7 +3451,7 @@ HTML = """<!doctype html>
         async function deleteWatch(id, label) {
             if (!confirm(`'${label}' 감시를 삭제할까요?`)) return;
             try {
-                const res = await fetch(`/api/watches/${id}`, {method: 'DELETE'});
+                const res = await fetchAuth(`/api/watches/${id}`, {method: 'DELETE'});
                 if (!res.ok) {
                     const body = await res.json().catch(() => ({}));
                     alert('삭제 실패: ' + (body.detail || res.status));
@@ -2950,7 +3476,7 @@ HTML = """<!doctype html>
         async function resetWatch(id) {
             if (!confirm('예매 결과를 초기화하고 다시 감시할까요?')) return;
             try {
-                const res = await fetch(`/api/watches/${id}/reset`, {method: 'POST'});
+                const res = await fetchAuth(`/api/watches/${id}/reset`, {method: 'POST'});
                 if (!res.ok) {
                     const body = await res.json().catch(() => ({}));
                     alert('초기화 실패: ' + (body.detail || res.status));
@@ -2969,7 +3495,7 @@ HTML = """<!doctype html>
             btn.textContent = '발송 중...';
             
             try {
-                const r = await fetch('/api/test-email', { method: 'POST' });
+                const r = await fetchAuth('/api/test-email', { method: 'POST' });
                 const j = await r.json();
                 const resultEl = document.getElementById('email-result');
                 resultEl.textContent = j.ok ? '✅ 발송 성공' : '❌ 발송 실패';
@@ -2982,34 +3508,52 @@ HTML = """<!doctype html>
             }
         }
 
-        async function openNotifyEditor() {
+        async function openMyAccount() {
             try {
-                const res = await fetch('/api/settings');
+                const res = await fetchAuth('/api/me');
                 const data = await res.json();
-                const emails = (data.notify_emails || []);
-                document.getElementById('notify-emails-input').value = emails.join('\\n');
-                document.getElementById('notify-result').textContent = '';
-                document.getElementById('notify-result').className = 'form-result';
-                document.getElementById('notify-modal').hidden = false;
+                const me = data.user || {};
+                document.getElementById('me-username').textContent = me.username + (me.is_admin ? ' (관리자)' : '');
+                document.getElementById('me-email-input').value = me.email || '';
+                document.getElementById('me-notify-toggle').checked = !!me.notify_enabled;
+                document.getElementById('me-current-pw').value = '';
+                document.getElementById('me-new-pw').value = '';
+                const resultEl = document.getElementById('account-result');
+                resultEl.textContent = '';
+                resultEl.className = 'form-result';
+                document.getElementById('account-modal').hidden = false;
             } catch (e) {
-                alert('설정 불러오기 실패: ' + e);
+                if (e.message !== 'not authenticated') alert('내 정보 불러오기 실패: ' + e);
             }
         }
 
-        function closeNotifyEditor(ev) {
-            if (ev && ev.target.id && ev.target.id !== 'notify-modal') return;
-            document.getElementById('notify-modal').hidden = true;
+        function closeMyAccount(ev) {
+            if (ev && ev.target.id && ev.target.id !== 'account-modal') return;
+            document.getElementById('account-modal').hidden = true;
         }
 
-        async function saveNotifyEmails() {
-            const raw = document.getElementById('notify-emails-input').value;
-            const list = raw.split(/[\\s,]+/).map(s => s.trim()).filter(s => s.length && s.includes('@'));
-            const resultEl = document.getElementById('notify-result');
+        async function saveMyAccount() {
+            const resultEl = document.getElementById('account-result');
+            const email = document.getElementById('me-email-input').value.trim();
+            const notify = document.getElementById('me-notify-toggle').checked;
+            const currentPw = document.getElementById('me-current-pw').value;
+            const newPw = document.getElementById('me-new-pw').value;
+
+            const payload = { email: email, notify_enabled: notify };
+            if (newPw) {
+                if (!currentPw) {
+                    resultEl.textContent = '비밀번호를 바꾸려면 현재 비밀번호 필요';
+                    resultEl.className = 'form-result error';
+                    return;
+                }
+                payload.current_password = currentPw;
+                payload.password = newPw;
+            }
             try {
-                const res = await fetch('/api/settings', {
+                const res = await fetchAuth('/api/me', {
                     method: 'PATCH',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({notify_emails: list}),
+                    body: JSON.stringify(payload),
                 });
                 const data = await res.json();
                 if (!res.ok) {
@@ -3017,13 +3561,14 @@ HTML = """<!doctype html>
                     resultEl.className = 'form-result error';
                     return;
                 }
-                resultEl.textContent = `저장됨 (${list.length}명)`;
+                resultEl.textContent = '저장됨';
                 resultEl.className = 'form-result success';
                 setTimeout(() => {
-                    document.getElementById('notify-modal').hidden = true;
+                    document.getElementById('account-modal').hidden = true;
                     updateDashboard();
-                }, 800);
+                }, 700);
             } catch (e) {
+                if (e.message === 'not authenticated') return;
                 resultEl.textContent = '오류: ' + e;
                 resultEl.className = 'form-result error';
             }
@@ -3039,8 +3584,19 @@ HTML = """<!doctype html>
 
 
 @app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
+def index(request: Request):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not verify_session_token(token):
+        return RedirectResponse(url="/login", status_code=303)
     return HTMLResponse(HTML)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if verify_session_token(token):
+        return RedirectResponse(url="/", status_code=303)
+    return HTMLResponse(LOGIN_HTML)
 
 
 def main() -> None:
