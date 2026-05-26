@@ -123,6 +123,8 @@ INTERVAL = float(os.getenv("SRT_INTERVAL", "4"))
 STANDBY = os.getenv("SRT_STANDBY", "0") == "1"
 PORT = int(os.getenv("DASH_PORT", "8765"))
 HOST = os.getenv("DASH_HOST", "127.0.0.1")
+# SRT_AUTO_BOOKING=0 이면 SRT 로그인/자동 예매 워커를 시작하지 않음 (조회 전용 모드).
+AUTO_BOOKING = os.getenv("SRT_AUTO_BOOKING", "1") == "1"
 # 결제 확인 동작: 예매 후 60초부터 시작 → 30초 간격으로 SRT 실제 결제 마감 + grace까지 체크
 PAYMENT_CHECK_START_SECONDS = int(os.getenv("SRT_PAYMENT_CHECK_START_SECONDS", "60"))
 PAYMENT_CHECK_RETRY_SECONDS = int(os.getenv("SRT_PAYMENT_CHECK_RETRY_SECONDS", "30"))
@@ -3042,8 +3044,13 @@ def index() -> HTMLResponse:
 
 
 def main() -> None:
-    t = threading.Thread(target=worker_loop, name="srt-worker", daemon=True)
-    t.start()
+    if AUTO_BOOKING:
+        t = threading.Thread(target=worker_loop, name="srt-worker", daemon=True)
+        t.start()
+    else:
+        STATE.worker_status = "disabled"
+        STATE.login_status = "disabled"
+        STATE.log("SRT 자동 예매 비활성 (SRT_AUTO_BOOKING=0) — 조회 전용 모드")
     print(f"\n  대시보드: http://{HOST}:{PORT}\n", flush=True)
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
 
