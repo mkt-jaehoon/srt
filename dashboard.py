@@ -770,7 +770,8 @@ class LegState:
 
 class State:
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        # RLock: lock 보유 중 log() 등 재진입 호출이 있어 일반 Lock 이면 self-deadlock
+        self.lock = threading.RLock()
         self.started_at = datetime.now().isoformat(timespec="seconds")
         self.worker_status = "starting"   # starting / running / done / error / stopped
         self.login_status = "pending"
