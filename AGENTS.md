@@ -68,6 +68,21 @@ systemctl restart srt-dashboard
 systemctl stop srt-dashboard
 ```
 
+## systemd Unit Hardening (2026-06-04 장애 재발 방지)
+- 2026-06-04 장애: 고아 프로세스가 8765 포트를 점유 → systemd가 5초 간격 무한 재시작 → 재시작마다 SRT 로그인 시도(5시간 동안 3,400회+).
+- 코드 수정으로 포트 바인드 실패 시 SRT 로그인 전에 종료되도록 변경됨 (`dashboard.py` `main()` 의 bind probe).
+- 추가로 유닛 파일(`/etc/systemd/system/srt-dashboard.service`)의 `[Service]`/`[Unit]`에 재시작 제한 권장:
+```ini
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+RestartSec=30
+```
+- 적용: `systemctl daemon-reload && systemctl restart srt-dashboard`
+- 포트 점유 의심 시: `ss -ltnp | grep 8765` 로 PID 확인 후 `kill <PID>`.
+
 ## Deployment Flow
 - Code changes should be committed and pushed to GitHub.
 - On NCP server:

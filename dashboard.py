@@ -29,6 +29,7 @@ import logging
 import os
 import secrets
 import smtplib
+import socket
 import threading
 import time
 from collections import deque
@@ -1322,64 +1323,70 @@ def worker_loop() -> None:
         )
 
     while not STOP.is_set():
-        # 매 사이클마다 디스크 → 메모리 동기화 (UI 에서 추가/삭제 반영)
-        STATE.sync_legs(load_watches())
-        refresh_booking_results(srt)
-        sync_results_to_disk()
+        try:
+            # 매 사이클마다 디스크 → 메모리 동기화 (UI 에서 추가/삭제 반영)
+            STATE.sync_legs(load_watches())
+            refresh_booking_results(srt)
+            sync_results_to_disk()
 
-        # 예매 오픈 대기 체크
-        now = datetime.now()
-        with STATE.lock:
-            for leg in STATE.legs.values():
-                open_at = booking_window_open_at(leg.cfg["date"])
-                if open_at > now:
-                    leg.awaiting_window_open_at = open_at.isoformat(timespec="seconds")
-                else:
-                    leg.awaiting_window_open_at = None
+            # 예매 오픈 대기 체크
+            now = datetime.now()
+            with STATE.lock:
+                for leg in STATE.legs.values():
+                    open_at = booking_window_open_at(leg.cfg["date"])
+                    if open_at > now:
+                        leg.awaiting_window_open_at = open_at.isoformat(timespec="seconds")
+                    else:
+                        leg.awaiting_window_open_at = None
 
-        all_legs = list(STATE.legs.values())
-        active_legs = [leg for leg in all_legs if leg.cfg.get("active", True)]
-        pending_legs = [
-            leg for leg in active_legs
-            if leg.result is None and leg.awaiting_window_open_at is None
-        ]
+            all_legs = list(STATE.legs.values())
+            active_legs = [leg for leg in all_legs if leg.cfg.get("active", True)]
+            pending_legs = [
+                leg for leg in active_legs
+                if leg.result is None and leg.awaiting_window_open_at is None
+            ]
 
-        awaiting_count = sum(1 for leg in all_legs if leg.awaiting_window_open_at)
+            awaiting_count = sum(1 for leg in all_legs if leg.awaiting_window_open_at)
 
-        if not all_legs:
-            STATE.worker_status = "idle"
-            time.sleep(min(INTERVAL, 10))
-            continue
-
-        if not pending_legs:
-            # 활성 leg 중 결제 대기 단계가 있으면 그 진행을 보여줌
-            has_waiting_payment = any(
-                leg.result and not leg.result.get("paid")
-                and leg.result.get("type") == "reserve"
-                for leg in active_legs
-            )
-            if has_waiting_payment:
-                STATE.worker_status = "waiting_payment"
-            elif awaiting_count > 0 and awaiting_count == len(all_legs):
-                STATE.worker_status = "awaiting_window"
-            else:
+            if not all_legs:
                 STATE.worker_status = "idle"
-            time.sleep(min(INTERVAL, 10))
-            continue
-
-        STATE.worker_status = "running"
-
-        for leg in pending_legs:
-            if STOP.is_set():
-                break
-            done = try_leg(srt, leg)
-            if done:
-                sync_results_to_disk()
+                time.sleep(min(INTERVAL, 10))
                 continue
-            time.sleep(0.5)   # leg 간 짧은 간격
 
-        if any(leg.cfg.get("active", True) and leg.result is None for leg in STATE.legs.values()):
-            time.sleep(INTERVAL)
+            if not pending_legs:
+                # 활성 leg 중 결제 대기 단계가 있으면 그 진행을 보여줌
+                has_waiting_payment = any(
+                    leg.result and not leg.result.get("paid")
+                    and leg.result.get("type") == "reserve"
+                    for leg in active_legs
+                )
+                if has_waiting_payment:
+                    STATE.worker_status = "waiting_payment"
+                elif awaiting_count > 0 and awaiting_count == len(all_legs):
+                    STATE.worker_status = "awaiting_window"
+                else:
+                    STATE.worker_status = "idle"
+                time.sleep(min(INTERVAL, 10))
+                continue
+
+            STATE.worker_status = "running"
+
+            for leg in pending_legs:
+                if STOP.is_set():
+                    break
+                done = try_leg(srt, leg)
+                if done:
+                    sync_results_to_disk()
+                    continue
+                time.sleep(0.5)   # leg 간 짧은 간격
+
+            if any(leg.cfg.get("active", True) and leg.result is None for leg in STATE.legs.values()):
+                time.sleep(INTERVAL)
+        except Exception as e:
+            # 예기치 못한 예외로 워커 스레드가 조용히 죽는 것 방지 (네트워크 오류 등)
+            STATE.last_error = f"worker: {type(e).__name__}: {e}"
+            STATE.log(f"워커 오류 — 30초 후 재시도: {type(e).__name__}: {e}")
+            time.sleep(30)
 
     STATE.worker_status = "stopped"
 
@@ -3600,6 +3607,18 @@ def login_page(request: Request):
 
 
 def main() -> None:
+    # 포트 바인드 가능 여부를 SRT 로그인 전에 확인.
+    # systemd 재시작 루프에서 매번 로그인부터 시도하면 로그인 폭탄이 되므로 먼저 죽는다.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((HOST, PORT))
+    except OSError as e:
+        print(f"포트 {HOST}:{PORT} 사용 불가 ({e}) — SRT 로그인 없이 종료", flush=True)
+        raise SystemExit(1)
+    finally:
+        probe.close()
+
     if AUTO_BOOKING:
         t = threading.Thread(target=worker_loop, name="srt-worker", daemon=True)
         t.start()
