@@ -34,6 +34,21 @@
 - 회원가입: 기본 활성 (`SRT_ALLOW_SIGNUP=0` 으로 차단 가능). 로그인 페이지의 '가입' 탭에서 self-signup.
 - 사용자별 알림 이메일: 로그인 후 "내 계정" 모달에서 각자 설정. 자기 이메일만 변경 가능.
 - 관리자(`is_admin=true`)는 `GET /api/users`, `DELETE /api/users/{id}` 가능.
+- 가입 도메인 제한: `.env` 의 `SRT_ALLOWED_EMAIL_DOMAINS=madup.com,example.com` 형태로 쉼표 구분. 비어 있으면 제한 없음. 관리자는 본인 이메일 변경 시 우회.
+- Brute-force 방지: 로그인 실패 5회 → 30초 잠금 (기본값, `SRT_LOGIN_LOCK_THRESHOLD`/`SRT_LOGIN_LOCK_SECONDS` 로 조정).
+- 세션 쿠키: `SameSite=strict` (기본). HTTPS 종단 시 `SRT_COOKIE_SECURE=1` 로 `Secure` flag 켜기.
+
+## Notifications
+- 이메일: SMTP (`SMTP_*` env). 알림 받을 사용자는 본인 계정에서 `notify_enabled` 켜야 함.
+- Slack DM/채널: `.env` 의 `SLACK_WEBHOOK_URL` 에 Incoming Webhook URL 추가 후 restart. 비어 있으면 비활성.
+- 예매 성공 시 두 채널 모두 시도 (한쪽 실패해도 다른 쪽 진행).
+- 대시보드의 "Slack 테스트" 버튼은 webhook 설정 시에만 노출.
+
+## Data Files
+- `fares_from_suseo.json`: 수서 출발 운임표. 매년 갱신 가능 (코드와 분리).
+- `watches.json`: 감시 목록. `owner_id` 필드로 등록자 추적.
+- `users.json`: 사용자 계정 (해시 비번 + 이메일).
+- 세 파일 모두 동시성 락으로 read-modify-write 보호.
 
 ## Time Window / Stop Conditions
 - 시간대 옵션 API 껍데기는 구현되어 있으나, 현재 워커에는 연결하지 않았다.

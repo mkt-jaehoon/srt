@@ -32,9 +32,12 @@ import smtplib
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from datetime import datetime, timedelta
 from email.message import EmailMessage
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -57,41 +60,38 @@ logging.basicConfig(level=logging.WARNING)
 # 첫 실행 시 SEED_WATCHES 가 자동 시드됨.
 WATCHES_PATH = Path(os.getenv("SRT_WATCHES_PATH", "watches.json"))
 
-# 수서 출발 운임표 (SRT 운임요금표 2026-05-15 기준, 단위: 원, 성인 1인)
-# 키는 SRT API 표기. 사용자는 수서 출발만 사용.
-SRT_FARES_FROM_SUSEO: dict[str, dict[str, int]] = {
-    "동탄":       {"general":  7500, "special": 10900},
-    "평택지제":   {"general":  7700, "special": 11200},
-    "천안아산":   {"general": 11300, "special": 16400},
-    "오송":       {"general": 15400, "special": 22300},
-    "대전":       {"general": 20100, "special": 29100},
-    "김천(구미)": {"general": 30300, "special": 43900},
-    "서대구":     {"general": 36400, "special": 52800},
-    "동대구":     {"general": 37400, "special": 54200},
-    "경주":       {"general": 42700, "special": 61900},
-    "울산(통도사)": {"general": 46800, "special": 67900},
-    "부산":       {"general": 52600, "special": 76300},
-    "공주":       {"general": 21600, "special": 31300},
-    "익산":       {"general": 28000, "special": 40600},
-    "정읍":       {"general": 33900, "special": 49200},
-    "광주송정":   {"general": 40700, "special": 59000},
-    "나주":       {"general": 42100, "special": 61000},
-    "목포":       {"general": 46500, "special": 67400},
-    "전주":       {"general": 30300, "special": 43900},
-    "남원":       {"general": 35200, "special": 51000},
-    "곡성":       {"general": 36700, "special": 53200},
-    "구례구":     {"general": 38400, "special": 55700},
-    "순천":       {"general": 41000, "special": 59500},
-    "여천":       {"general": 43100, "special": 62500},
-    "여수EXPO":   {"general": 43800, "special": 63500},
-    "포항":       {"general": 47200, "special": 68400},
-    "밀양":       {"general": 42300, "special": 61300},
-    "진영":       {"general": 44400, "special": 64400},
-    "창원중앙":   {"general": 45600, "special": 66100},
-    "창원":       {"general": 46500, "special": 67400},
-    "마산":       {"general": 46900, "special": 68000},
-    "진주":       {"general": 51100, "special": 74100},
-}
+# 수서 출발 운임표 (단위: 원, 성인 1인) — fares_from_suseo.json 에서 로드.
+# 매년 갱신될 수 있어 코드와 분리. 키는 SRT API 표기.
+FARES_PATH = Path(os.getenv("SRT_FARES_PATH", "fares_from_suseo.json"))
+
+
+def _load_fares() -> dict[str, dict[str, int]]:
+    """fares_from_suseo.json 에서 운임표 로드. 없으면 빈 dict."""
+    if not FARES_PATH.exists():
+        return {}
+    try:
+        with FARES_PATH.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    fares = raw.get("fares") if isinstance(raw, dict) else None
+    if not isinstance(fares, dict):
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    for station, prices in fares.items():
+        if not isinstance(prices, dict):
+            continue
+        try:
+            out[str(station)] = {
+                "general": int(prices.get("general", 0)),
+                "special": int(prices.get("special", 0)),
+            }
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+SRT_FARES_FROM_SUSEO: dict[str, dict[str, int]] = _load_fares()
 
 # SRT 정차역 (srtrain.constants.STATION_CODE 기준)
 SRT_STATIONS: list[str] = [
@@ -149,7 +149,38 @@ USERS_PATH = Path(os.getenv("SRT_USERS_PATH", "users.json"))
 SESSION_SECRET_PATH = Path(os.getenv("SRT_SESSION_SECRET_PATH", ".session_secret"))
 SESSION_COOKIE_NAME = os.getenv("SRT_SESSION_COOKIE", "srt_session")
 SESSION_TTL_DAYS = int(os.getenv("SRT_SESSION_TTL_DAYS", "30"))
+COOKIE_SECURE = os.getenv("SRT_COOKIE_SECURE", "0") == "1"
+COOKIE_SAMESITE = os.getenv("SRT_COOKIE_SAMESITE", "strict")
+# Brute-force 방지: 로그인 실패 N회 → M초 잠금
+LOGIN_LOCK_THRESHOLD = int(os.getenv("SRT_LOGIN_LOCK_THRESHOLD", "5"))
+LOGIN_LOCK_SECONDS = int(os.getenv("SRT_LOGIN_LOCK_SECONDS", "30"))
+# 가입 허용 도메인 (쉼표 구분). 비어 있으면 제한 없음.
+ALLOWED_EMAIL_DOMAINS = {
+    d.strip().lower().lstrip("@")
+    for d in os.getenv("SRT_ALLOWED_EMAIL_DOMAINS", "").split(",")
+    if d.strip()
+}
+# Slack 알림 (Incoming Webhook URL). 비어 있으면 비활성.
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 TIME_OPTIONS_ROUTE = {"dep": "수서", "arr": "부산"}
+
+
+class SeatStrategy(str, Enum):
+    """좌석 전략. JSON 직렬화 시 문자열 그대로."""
+    TOGETHER_ONLY = "together_only"   # Adult(N) 한 번에만 시도 (연석 보장)
+    SPLIT_OK = "split_ok"             # Adult(N) 실패 시 Adult(1) × N 분할 폴백
+
+
+def _normalize_seat_strategy(raw: Any, adults: int) -> str:
+    value = str(raw or "").strip().lower()
+    try:
+        strategy = SeatStrategy(value)
+    except ValueError:
+        strategy = SeatStrategy.SPLIT_OK
+    # 1인 예약은 분할 의미 없음 → 무조건 together_only
+    if adults < 2:
+        return SeatStrategy.TOGETHER_ONLY.value
+    return strategy.value
 
 
 def _empty_time_options() -> dict[str, Any]:
@@ -303,14 +334,10 @@ def normalize_watch(
     active = bool(raw.get("active", True))
     created_at = str(raw.get("created_at") or datetime.now().isoformat(timespec="seconds"))
     result = raw.get("result") if isinstance(raw.get("result"), dict) else None
+    seat_strategy = _normalize_seat_strategy(raw.get("seat_strategy"), adults)
 
-    # 좌석 전략:
-    #  - "together_only" : Adult(N) 한 번에만 시도 (= 사실상 연석 보장)
-    #  - "split_ok"      : Adult(N) 실패시 Adult(1) × N 분할 폴백 (기본, 2인 이상에서만 의미)
-    raw_strategy = str(raw.get("seat_strategy") or "").strip().lower()
-    if raw_strategy not in {"together_only", "split_ok"}:
-        raw_strategy = "split_ok"
-    seat_strategy = raw_strategy if adults >= 2 else "together_only"
+    owner_id_raw = raw.get("owner_id")
+    owner_id = str(owner_id_raw).strip() if owner_id_raw else ""
 
     return {
         "id": existing_id or str(raw.get("id") or uuid4().hex[:8]),
@@ -325,6 +352,7 @@ def normalize_watch(
         "active": active,
         "created_at": created_at,
         "result": result,
+        "owner_id": owner_id,
     }
 
 
@@ -332,18 +360,22 @@ def _seed_watches_payload() -> list[dict[str, Any]]:
     return [normalize_watch(dict(w)) for w in SEED_WATCHES]
 
 
+_WATCHES_LOCK = threading.RLock()
+
+
 def load_watches() -> list[dict[str, Any]]:
     """디스크에서 watches 목록을 읽어 정규화. 없으면 seed 생성."""
-    if not WATCHES_PATH.exists():
-        watches = _seed_watches_payload()
-        save_watches(watches)
-        return watches
+    with _WATCHES_LOCK:
+        if not WATCHES_PATH.exists():
+            watches = _seed_watches_payload()
+            save_watches(watches)
+            return watches
 
-    try:
-        with WATCHES_PATH.open("r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return _seed_watches_payload()
+        try:
+            with WATCHES_PATH.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return _seed_watches_payload()
 
     items = raw.get("watches", []) if isinstance(raw, dict) else []
     out: list[dict[str, Any]] = []
@@ -366,7 +398,21 @@ def _atomic_write_json(path: Path, data: Any) -> None:
 
 def save_watches(watches: list[dict[str, Any]]) -> None:
     payload = {"schema_version": 1, "watches": watches}
-    _atomic_write_json(WATCHES_PATH, payload)
+    with _WATCHES_LOCK:
+        _atomic_write_json(WATCHES_PATH, payload)
+
+
+def mutate_watches(fn):
+    """원자적 read-modify-write 헬퍼.
+
+    fn(watches) -> new_watches 형태. 락을 들고 다시 디스크에서 읽은 후 fn 적용
+    → 저장. 동시 PATCH/DELETE 변경 손실 방지.
+    """
+    with _WATCHES_LOCK:
+        watches = load_watches()
+        new_watches = fn(watches)
+        save_watches(new_watches)
+        return new_watches
 
 
 def find_watch(watches: list[dict[str, Any]], watch_id: str) -> dict[str, Any] | None:
@@ -777,6 +823,7 @@ class State:
         self.login_status = "pending"
         self.last_error: str | None = None
         self.email_status = "not-sent"
+        self.slack_status = "not-configured" if not SLACK_WEBHOOK_URL else "not-sent"
         self.legs: dict[str, LegState] = {}
         self.logs: deque[str] = deque(maxlen=300)
         # 최초 1회 디스크에서 동기화
@@ -820,6 +867,8 @@ class State:
                 "login_status": self.login_status,
                 "last_error": self.last_error,
                 "email_status": self.email_status,
+                "slack_status": self.slack_status,
+                "slack_enabled": bool(SLACK_WEBHOOK_URL),
                 "notify_emails": get_notify_emails(),
                 "interval": INTERVAL,
                 "standby": STANDBY,
@@ -905,6 +954,42 @@ def send_email(subject: str, body: str) -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
+def send_slack(text: str, *, title: str | None = None) -> tuple[bool, str]:
+    """Slack Incoming Webhook 으로 메시지 전송. URL 미설정 시 비활성.
+
+    title 이 있으면 위에 굵게 표시 + 본문 코드블록.
+    """
+    if not SLACK_WEBHOOK_URL:
+        return False, "SLACK_WEBHOOK_URL 미설정"
+    if title:
+        payload_text = f"*{title}*\n```{text}```"
+    else:
+        payload_text = text
+    data = json.dumps({"text": payload_text}).encode("utf-8")
+    req = urllib.request.Request(
+        SLACK_WEBHOOK_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read().decode("utf-8", errors="replace").strip()
+            if resp.status == 200 and body.lower() == "ok":
+                return True, "sent"
+            return False, f"status={resp.status} body={body[:200]}"
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            err_body = ""
+        return False, f"HTTP {e.code}: {err_body}"
+    except (urllib.error.URLError, socket.timeout) as e:
+        return False, f"{type(e).__name__}: {e}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def notify_booking(leg: LegState) -> None:
     cfg = leg.cfg
     route = leg_route(cfg)
@@ -951,6 +1036,16 @@ def notify_booking(leg: LegState) -> None:
         f"email → {', '.join(get_notify_emails())}: "
         f"{'OK' if ok else 'FAIL ' + info}"
     )
+
+    # Slack 알림 (옵션). 이메일과 별도로 시도 → 한쪽 실패해도 다른 쪽 진행.
+    if SLACK_WEBHOOK_URL:
+        slack_ok, slack_info = send_slack(body, title=subject)
+        with STATE.lock:
+            STATE.slack_status = (
+                f"{datetime.now():%H:%M:%S} {leg.name}: "
+                + ("OK" if slack_ok else f"FAIL ({slack_info})")
+            )
+        STATE.log(f"slack → {'OK' if slack_ok else 'FAIL ' + slack_info}")
 
 
 def _effective_search_start(cfg: dict[str, Any]) -> str:
@@ -1408,9 +1503,74 @@ def _set_session_cookie(resp: JSONResponse, token: str) -> None:
         token,
         max_age=SESSION_TTL_DAYS * 86400,
         httponly=True,
-        samesite="lax",
+        samesite=COOKIE_SAMESITE,
+        secure=COOKIE_SECURE,
         path="/",
     )
+
+
+# --- Brute-force 방지 (in-memory) ---
+_LOGIN_ATTEMPTS_LOCK = threading.Lock()
+_LOGIN_ATTEMPTS: dict[str, dict[str, float]] = {}  # username_lower → {fails, locked_until}
+
+
+def _login_attempt_key(username: str) -> str:
+    return (username or "").strip().lower()
+
+
+def _check_login_lock(username: str) -> None:
+    key = _login_attempt_key(username)
+    if not key:
+        return
+    with _LOGIN_ATTEMPTS_LOCK:
+        entry = _LOGIN_ATTEMPTS.get(key)
+        if not entry:
+            return
+        locked_until = entry.get("locked_until", 0)
+        if locked_until and locked_until > time.time():
+            remain = int(locked_until - time.time())
+            raise HTTPException(
+                status_code=429,
+                detail=f"로그인 시도가 너무 잦습니다. {remain}초 후 다시 시도하세요.",
+            )
+
+
+def _record_login_failure(username: str) -> None:
+    key = _login_attempt_key(username)
+    if not key:
+        return
+    with _LOGIN_ATTEMPTS_LOCK:
+        entry = _LOGIN_ATTEMPTS.setdefault(key, {"fails": 0, "locked_until": 0})
+        entry["fails"] = entry.get("fails", 0) + 1
+        if entry["fails"] >= LOGIN_LOCK_THRESHOLD:
+            entry["locked_until"] = time.time() + LOGIN_LOCK_SECONDS
+            entry["fails"] = 0
+            STATE.log(f"로그인 잠금 발동: {key} ({LOGIN_LOCK_SECONDS}초)")
+
+
+def _clear_login_failures(username: str) -> None:
+    key = _login_attempt_key(username)
+    with _LOGIN_ATTEMPTS_LOCK:
+        _LOGIN_ATTEMPTS.pop(key, None)
+
+
+def _validate_signup_email(email: str) -> str:
+    """가입용 이메일 검증. 빈 문자열 OK (선택 입력). 도메인 화이트리스트 적용."""
+    if not email:
+        return ""
+    if "@" not in email or email.count("@") != 1:
+        raise HTTPException(status_code=400, detail="이메일 형식이 올바르지 않습니다")
+    local, _, domain = email.partition("@")
+    domain = domain.lower()
+    if not local or not domain:
+        raise HTTPException(status_code=400, detail="이메일 형식이 올바르지 않습니다")
+    if ALLOWED_EMAIL_DOMAINS and domain not in ALLOWED_EMAIL_DOMAINS:
+        allowed = ", ".join(sorted(ALLOWED_EMAIL_DOMAINS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"가입 가능 이메일 도메인: {allowed}",
+        )
+    return email
 
 
 @app.post("/api/login")
@@ -1419,9 +1579,12 @@ def api_login(payload: dict[str, Any]) -> JSONResponse:
     password = str(payload.get("password") or "")
     if not username or not password:
         raise HTTPException(status_code=400, detail="username/password required")
+    _check_login_lock(username)
     user = find_user_by_username(username)
     if not user or not _verify_password(password, user["password_hash"]):
+        _record_login_failure(username)
         raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 올바르지 않습니다")
+    _clear_login_failures(username)
     token = create_session_token(user["id"])
     resp = JSONResponse({"ok": True, "user": public_user(user)})
     _set_session_cookie(resp, token)
@@ -1445,13 +1608,11 @@ def api_signup(payload: dict[str, Any]) -> JSONResponse:
         raise HTTPException(status_code=403, detail="signup disabled")
     username = str(payload.get("username") or "").strip()
     password = str(payload.get("password") or "")
-    email = str(payload.get("email") or "").strip()
+    email = _validate_signup_email(str(payload.get("email") or "").strip())
     if not username or not password:
         raise HTTPException(status_code=400, detail="username/password required")
     if len(password) < 4:
         raise HTTPException(status_code=400, detail="비밀번호는 4자 이상")
-    if email and "@" not in email:
-        raise HTTPException(status_code=400, detail="이메일 형식이 올바르지 않습니다")
     if find_user_by_username(username):
         raise HTTPException(status_code=409, detail="이미 사용 중인 아이디")
 
@@ -1497,7 +1658,10 @@ def api_update_me(
 
     if "email" in payload:
         new_email = str(payload.get("email") or "").strip()
-        if new_email and "@" not in new_email:
+        # 관리자는 도메인 화이트리스트 우회 (운영용 외부 이메일 허용)
+        if new_email and not target.get("is_admin"):
+            new_email = _validate_signup_email(new_email)
+        elif new_email and "@" not in new_email:
             raise HTTPException(status_code=400, detail="이메일 형식이 올바르지 않습니다")
         if new_email != target.get("email", ""):
             target["email"] = new_email
@@ -1581,14 +1745,41 @@ def api_test_email(user: dict[str, Any] = Depends(current_user)) -> JSONResponse
     return JSONResponse({"ok": ok, "info": info, "to": get_notify_emails()})
 
 
+@app.post("/api/test-slack")
+def api_test_slack(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
+    if not SLACK_WEBHOOK_URL:
+        raise HTTPException(
+            status_code=400,
+            detail="SLACK_WEBHOOK_URL 미설정 (서버 .env 추가 후 restart 필요)",
+        )
+    ok, info = send_slack(
+        f"SRT 대시보드 Slack 알림 테스트\n시각: {datetime.now():%Y-%m-%d %H:%M:%S}\n발신자: {user['username']}",
+        title="[SRT] Slack 알림 테스트",
+    )
+    with STATE.lock:
+        STATE.slack_status = (
+            f"{datetime.now():%H:%M:%S} test: " + ("OK" if ok else f"FAIL ({info})")
+        )
+    return JSONResponse({"ok": ok, "info": info})
+
+
 @app.get("/api/settings")
 def api_get_settings(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
     return JSONResponse(load_settings())
 
 
+def _owner_map() -> dict[str, str]:
+    """user_id → username 매핑 (감시 목록에 보여주기 위함)."""
+    return {u["id"]: u["username"] for u in load_users()}
+
+
 @app.get("/api/watches")
 def api_list_watches(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
-    return JSONResponse({"watches": load_watches(), "stations": SRT_STATIONS})
+    owners = _owner_map()
+    watches = load_watches()
+    for w in watches:
+        w["owner_username"] = owners.get(w.get("owner_id", ""), "")
+    return JSONResponse({"watches": watches, "stations": SRT_STATIONS})
 
 
 @app.post("/api/watches")
@@ -1596,22 +1787,26 @@ def api_create_watch(
     payload: dict[str, Any],
     user: dict[str, Any] = Depends(current_user),
 ) -> JSONResponse:
+    # 새 감시는 현재 로그인 사용자를 owner 로 자동 지정
+    payload = dict(payload)
+    payload["owner_id"] = user["id"]
     try:
         item = normalize_watch(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    watches = load_watches()
-    watches.append(item)
+    def _add(watches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return watches + [item]
+
     try:
-        save_watches(watches)
+        new_watches = mutate_watches(_add)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    STATE.sync_legs(watches)
+    STATE.sync_legs(new_watches)
     STATE.log(
         f"감시 추가 [{item['id']}] {item['dep']}→{item['arr']} {item['date']} "
-        f"{item['time_start'][:4]}~{item['time_end'][:4]}"
+        f"{item['time_start'][:4]}~{item['time_end'][:4]} (by {user['username']})"
     )
     return JSONResponse({"ok": True, "watch": item})
 
@@ -1622,33 +1817,34 @@ def api_update_watch(
     payload: dict[str, Any],
     user: dict[str, Any] = Depends(current_user),
 ) -> JSONResponse:
-    watches = load_watches()
-    target = find_watch(watches, watch_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="watch not found")
+    new_watches_holder: dict[str, Any] = {}
 
-    merged = dict(target)
-    for key in ("label", "dep", "arr", "date", "time_start", "time_end", "adults", "active", "seat_strategy"):
-        if key in payload:
-            merged[key] = payload[key]
+    def _patch(watches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        target = find_watch(watches, watch_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="watch not found")
+        merged = dict(target)
+        for key in ("label", "dep", "arr", "date", "time_start", "time_end", "adults", "active", "seat_strategy"):
+            if key in payload:
+                merged[key] = payload[key]
+        # owner_id 보존 (PATCH 로 변경 불가)
+        merged["owner_id"] = target.get("owner_id", "")
+        updated = normalize_watch(merged, existing_id=watch_id)
+        updated["result"] = target.get("result")
+        updated["created_at"] = target.get("created_at", updated["created_at"])
+        new_watches_holder["watch"] = updated
+        return [updated if w["id"] == watch_id else w for w in watches]
 
     try:
-        updated = normalize_watch(merged, existing_id=watch_id)
+        new_watches = mutate_watches(_patch)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # result 와 created_at 보존
-    updated["result"] = target.get("result")
-    updated["created_at"] = target.get("created_at", updated["created_at"])
-
-    new_watches = [updated if w["id"] == watch_id else w for w in watches]
-    try:
-        save_watches(new_watches)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    updated = new_watches_holder["watch"]
     STATE.sync_legs(new_watches)
-    STATE.log(f"감시 수정 [{watch_id}] active={updated['active']}")
+    STATE.log(f"감시 수정 [{watch_id}] active={updated['active']} (by {user['username']})")
     return JSONResponse({"ok": True, "watch": updated})
 
 
@@ -1657,19 +1853,22 @@ def api_delete_watch(
     watch_id: str,
     user: dict[str, Any] = Depends(current_user),
 ) -> JSONResponse:
-    watches = load_watches()
-    target = find_watch(watches, watch_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="watch not found")
+    found: dict[str, Any] = {}
 
-    new_watches = [w for w in watches if w["id"] != watch_id]
+    def _delete(watches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        target = find_watch(watches, watch_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="watch not found")
+        found["watch"] = target
+        return [w for w in watches if w["id"] != watch_id]
+
     try:
-        save_watches(new_watches)
+        new_watches = mutate_watches(_delete)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     STATE.sync_legs(new_watches)
-    STATE.log(f"감시 삭제 [{watch_id}]")
+    STATE.log(f"감시 삭제 [{watch_id}] (by {user['username']})")
     return JSONResponse({"ok": True, "removed_id": watch_id})
 
 
@@ -1679,16 +1878,22 @@ def api_reset_watch(
     user: dict[str, Any] = Depends(current_user),
 ) -> JSONResponse:
     """예매 결과를 초기화해서 다시 감시 상태로 돌림."""
-    watches = load_watches()
-    target = find_watch(watches, watch_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="watch not found")
+    reset_holder: dict[str, Any] = {}
 
-    target["result"] = None
+    def _reset(watches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        target = find_watch(watches, watch_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="watch not found")
+        target["result"] = None
+        reset_holder["watch"] = target
+        return watches
+
     try:
-        save_watches(watches)
+        mutate_watches(_reset)
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    target = reset_holder["watch"]
 
     with STATE.lock:
         leg = STATE.legs.get(watch_id)
@@ -2655,10 +2860,12 @@ HTML = """<!doctype html>
             </div>
             <div class="hero-actions">
                 <span id="me-info" class="hero-meta" style="font-size: 0.85rem;"></span>
-                <button class="btn" onclick="testEmail()">알림 테스트</button>
+                <button class="btn" onclick="testEmail()">이메일 테스트</button>
+                <button class="btn" id="slack-test-btn" onclick="testSlack()" hidden>Slack 테스트</button>
                 <button class="btn" onclick="openMyAccount()">내 계정</button>
                 <button class="btn" onclick="doLogout()">로그아웃</button>
                 <span id="email-result" class="hero-meta"></span>
+                <span id="slack-result" class="hero-meta"></span>
             </div>
         </header>
 
@@ -2908,6 +3115,8 @@ HTML = """<!doctype html>
                 document.getElementById('login-status').innerHTML =
                     `<span class="badge ${state.login_status === 'ok' ? 'badge-success' : 'badge-danger'}">${state.login_status.toUpperCase()}</span>`;
                 document.getElementById('polling-info').textContent = `${state.interval}초`;
+                const slackBtn = document.getElementById('slack-test-btn');
+                if (slackBtn) slackBtn.hidden = !state.slack_enabled;
                 document.getElementById('notify-info').textContent = (state.notify_emails || []).join(', ') || '(설정 안 됨)';
 
                 // Error Banner
@@ -3501,13 +3710,37 @@ HTML = """<!doctype html>
             const originalText = btn.textContent;
             btn.disabled = true;
             btn.textContent = '발송 중...';
-            
+
             try {
                 const r = await fetchAuth('/api/test-email', { method: 'POST' });
                 const j = await r.json();
                 const resultEl = document.getElementById('email-result');
-                resultEl.textContent = j.ok ? '✅ 발송 성공' : '❌ 발송 실패';
+                resultEl.textContent = j.ok ? '✅ 발송 성공' : '❌ ' + (j.info || '발송 실패');
                 setTimeout(() => resultEl.textContent = '', 5000);
+            } catch (e) {
+                console.error(e);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        }
+
+        async function testSlack() {
+            const btn = event.target;
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '발송 중...';
+
+            try {
+                const r = await fetchAuth('/api/test-slack', { method: 'POST' });
+                const j = await r.json().catch(() => ({}));
+                const resultEl = document.getElementById('slack-result');
+                if (r.ok && j.ok) {
+                    resultEl.textContent = '✅ Slack 전송 성공';
+                } else {
+                    resultEl.textContent = '❌ ' + (j.detail || j.info || 'Slack 실패');
+                }
+                setTimeout(() => resultEl.textContent = '', 6000);
             } catch (e) {
                 console.error(e);
             } finally {
