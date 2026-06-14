@@ -1,12 +1,14 @@
 # SRT Booking Project Notes
 
 ## Response / Work Style
+
 - 기본 응답은 한국어로 작성한다.
 - 실무용으로 짧고 명확하게 답한다.
 - 민감정보는 절대 출력하거나 커밋하지 않는다.
 - `.env`, 앱 비밀번호, SRT 계정 정보는 서버/로컬에만 둔다.
 
 ## Project
+
 - GitHub: `https://github.com/mkt-jaehoon/srt`
 - Main entrypoint: `dashboard.py`
 - CLI entrypoint: `book.py`
@@ -14,6 +16,7 @@
 - Dashboard port: `8765`
 
 ## Current Booking Logic
+
 - 왕복 자동예매 대시보드가 `dashboard.py`에서 실행된다.
 - 좌석 우선순위는 `일반석 > 특실`이다.
 - 이메일 알림은 유지한다.
@@ -26,6 +29,7 @@
 - 결제 미확인 시 해당 구간을 다시 감시 상태로 돌린다.
 
 ## Auth / Users
+
 - 대시보드는 `/login` 페이지에서 개별 로그인이 필요하다.
 - 사용자 저장소: `users.json` (gitignore). 비밀번호는 sha256+salt 로 해시.
 - 세션 쿠키: `srt_session` (HMAC 서명). 비밀키는 `.session_secret` 파일 (자동 생성, gitignore).
@@ -39,18 +43,21 @@
 - 세션 쿠키: `SameSite=strict` (기본). HTTPS 종단 시 `SRT_COOKIE_SECURE=1` 로 `Secure` flag 켜기.
 
 ## Notifications
+
 - 이메일: SMTP (`SMTP_*` env). 알림 받을 사용자는 본인 계정에서 `notify_enabled` 켜야 함.
 - Slack DM/채널: `.env` 의 `SLACK_WEBHOOK_URL` 에 Incoming Webhook URL 추가 후 restart. 비어 있으면 비활성.
 - 예매 성공 시 두 채널 모두 시도 (한쪽 실패해도 다른 쪽 진행).
 - 대시보드의 "Slack 테스트" 버튼은 webhook 설정 시에만 노출.
 
 ## Data Files
+
 - `fares_from_suseo.json`: 수서 출발 운임표. 매년 갱신 가능 (코드와 분리).
 - `watches.json`: 감시 목록. `owner_id` 필드로 등록자 추적.
 - `users.json`: 사용자 계정 (해시 비번 + 이메일).
 - 세 파일 모두 동시성 락으로 read-modify-write 보호.
 
 ## Time Window / Stop Conditions
+
 - 시간대 옵션 API 껍데기는 구현되어 있으나, 현재 워커에는 연결하지 않았다.
 - `GET /api/time-options`
 - `POST /api/time-options/windows`
@@ -61,12 +68,13 @@
   - 상행: 2026-05-24 23:59 KST 이후 감시 종료
 
 ## NCP Server Operation
+
 - Server IP: `49.50.136.239`
 - Server user used during setup: `root`
-- Server project path: `/root/srt`
+- Server project path: `/root/SRT`
 - Service manager: `systemd`
 - Service name: `srt-dashboard`
-- Service working directory: `/root/srt`
+- Service working directory: `/root/SRT`
 - Service command: `/root/.local/bin/uv run python dashboard.py`
 - Server dashboard listens on `127.0.0.1:8765`.
 - The dashboard is not publicly exposed.
@@ -76,6 +84,7 @@
   - Browser URL after tunnel: `http://127.0.0.1:8765`
 
 ## Server Commands
+
 ```bash
 systemctl status srt-dashboard
 journalctl -u srt-dashboard -f
@@ -84,9 +93,11 @@ systemctl stop srt-dashboard
 ```
 
 ## systemd Unit Hardening (2026-06-04 장애 재발 방지)
+
 - 2026-06-04 장애: 고아 프로세스가 8765 포트를 점유 → systemd가 5초 간격 무한 재시작 → 재시작마다 SRT 로그인 시도(5시간 동안 3,400회+).
 - 코드 수정으로 포트 바인드 실패 시 SRT 로그인 전에 종료되도록 변경됨 (`dashboard.py` `main()` 의 bind probe).
 - 추가로 유닛 파일(`/etc/systemd/system/srt-dashboard.service`)의 `[Service]`/`[Unit]`에 재시작 제한 권장:
+
 ```ini
 [Unit]
 StartLimitIntervalSec=300
@@ -95,21 +106,26 @@ StartLimitBurst=5
 [Service]
 RestartSec=30
 ```
+
 - 적용: `systemctl daemon-reload && systemctl restart srt-dashboard`
 - 포트 점유 의심 시: `ss -ltnp | grep 8765` 로 PID 확인 후 `kill <PID>`.
 
 ## Deployment Flow
+
 - Code changes should be committed and pushed to GitHub.
 - On NCP server:
+
 ```bash
-cd /root/srt
+cd /root/SRT
 git pull origin main
 systemctl restart srt-dashboard
 ```
+
 - Do not upload code manually with WinSCP unless there is a specific reason.
 - WinSCP is mainly for checking/editing server-only files such as `.env`.
 
 ## Do Not Commit
+
 - `.env`
 - any `*.env` copy
 - `*:Zone.Identifier`
