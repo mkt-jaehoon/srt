@@ -332,6 +332,7 @@ def normalize_watch(
     )
 
     active = bool(raw.get("active", True))
+    autopay = bool(raw.get("autopay", False))
     created_at = str(raw.get("created_at") or datetime.now().isoformat(timespec="seconds"))
     result = raw.get("result") if isinstance(raw.get("result"), dict) else None
     seat_strategy = _normalize_seat_strategy(raw.get("seat_strategy"), adults)
@@ -350,6 +351,7 @@ def normalize_watch(
         "adults": adults,
         "seat_strategy": seat_strategy,
         "active": active,
+        "autopay": autopay,
         "created_at": created_at,
         "result": result,
         "owner_id": owner_id,
@@ -800,6 +802,64 @@ def get_notify_emails() -> list[str]:
     return out
 
 
+# === 카드 자동결제 (메모리 전용) ===
+# 카드 정보는 프로세스 메모리에만 보관한다. watches.json / users.json / 로그 등
+# 어떤 디스크 파일에도 절대 기록하지 않으며, 서버 재시작 시 다시 입력해야 한다.
+_CARD_LOCK = threading.Lock()
+_CARD_STORE: dict[str, str] = {}
+
+
+def _digits(value: Any) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def set_autopay_card(
+    number: str, password: str, birth: str, expire: str, card_type: str = "J"
+) -> None:
+    """카드 정보를 메모리에 저장(검증 포함). 기존 값은 덮어쓴다."""
+    number = _digits(number)
+    password = _digits(password)
+    birth = _digits(birth)
+    expire = _digits(expire)
+    if len(number) not in (15, 16):
+        raise ValueError("카드번호는 15~16자리 숫자여야 합니다")
+    if len(password) != 2:
+        raise ValueError("카드 비밀번호 앞 2자리를 입력하세요")
+    if len(birth) != 6:
+        raise ValueError("생년월일 6자리(YYMMDD)를 입력하세요")
+    if len(expire) != 4:
+        raise ValueError("유효기간 4자리(YYMM)를 입력하세요")
+    card_type = card_type if card_type in ("J", "S") else "J"
+    with _CARD_LOCK:
+        _CARD_STORE.clear()
+        _CARD_STORE.update(
+            number=number, password=password, birth=birth,
+            expire=expire, card_type=card_type,
+        )
+
+
+def get_autopay_card() -> dict[str, str] | None:
+    with _CARD_LOCK:
+        return dict(_CARD_STORE) if _CARD_STORE else None
+
+
+def clear_autopay_card() -> None:
+    with _CARD_LOCK:
+        _CARD_STORE.clear()
+
+
+def card_public_status() -> dict[str, Any]:
+    """UI 표시용 — 카드번호 전체는 절대 반환하지 않고 뒤 4자리만."""
+    with _CARD_LOCK:
+        if not _CARD_STORE:
+            return {"registered": False}
+        return {
+            "registered": True,
+            "last4": _CARD_STORE["number"][-4:],
+            "card_type": _CARD_STORE["card_type"],
+        }
+
+
 class LegState:
     def __init__(self, name: str, cfg: dict[str, Any]) -> None:
         self.name = name
@@ -869,6 +929,7 @@ class State:
                 "email_status": self.email_status,
                 "slack_status": self.slack_status,
                 "slack_enabled": bool(SLACK_WEBHOOK_URL),
+                "card_registered": card_public_status()["registered"],
                 "notify_emails": get_notify_emails(),
                 "interval": INTERVAL,
                 "standby": STANDBY,
@@ -886,6 +947,7 @@ class State:
                         "adults": leg.cfg["adults"],
                         "seat_strategy": leg.cfg.get("seat_strategy", "together_only" if leg.cfg.get("adults", 1) < 2 else "split_ok"),
                         "active": bool(leg.cfg.get("active", True)),
+                        "autopay": bool(leg.cfg.get("autopay", False)),
                         "created_at": leg.cfg.get("created_at"),
                         "attempts": leg.attempts,
                         "last_poll_at": leg.last_poll_at,
@@ -1004,7 +1066,23 @@ def notify_booking(leg: LegState) -> None:
     elif is_split:
         head = f"분할 예매({len(reservations)}건)"
 
-    subject = f"[SRT] {cfg['label']} {head} — 결제 필요"
+    autopay_status = result.get("autopay_status")
+    if autopay_status == "paid":
+        pay_suffix = " — 결제 완료(자동결제) ✅"
+        pay_note = "✅ 등록된 카드로 자동결제까지 완료되었습니다."
+    elif autopay_status in {"failed", "partial", "no_card"}:
+        pay_suffix = " — ⚠️ 자동결제 실패! 수동 결제 필요"
+        reason = {
+            "no_card": "카드 미등록",
+            "partial": "일부만 결제됨",
+            "failed": result.get("autopay_error", "결제 실패"),
+        }.get(autopay_status, "결제 실패")
+        pay_note = f"⚠️ 자동결제 실패({reason}) — 결제 마감 전 SRT 앱에서 직접 결제하세요."
+    else:
+        pay_suffix = " — 결제 필요"
+        pay_note = "결제 마감 전 SRT 앱에서 결제하세요."
+
+    subject = f"[SRT] {cfg['label']} {head}{pay_suffix}"
 
     res_blocks = []
     for idx, r in enumerate(reservations, 1):
@@ -1018,7 +1096,7 @@ def notify_booking(leg: LegState) -> None:
         )
 
     body = (
-        f"SRT 자동 예매 결과입니다. 결제 마감 전 SRT 앱에서 결제하세요.\n\n"
+        f"SRT 자동 예매 결과입니다. {pay_note}\n\n"
         f"구간       : {route['dep']} → {route['arr']}\n"
         f"일자       : {cfg['date']}\n"
         f"인원       : 성인 {cfg['adults']}명\n"
@@ -1075,6 +1153,58 @@ def _attempt_split_booking(
             last_error = str(e)
             break
     return succeeded, last_error
+
+
+def attempt_autopay(srt: SRT, leg: LegState, reserve_objs: list) -> None:
+    """watch.autopay 가 켜져 있고 카드가 등록돼 있으면 즉시 카드결제까지 진행.
+
+    결과를 leg.result 의 paid / payment_status / autopay_status 에 반영한다.
+    결제 단계 예외로 워커 루프가 죽지 않도록 모든 예외를 흡수한다.
+    """
+    if not leg.cfg.get("autopay"):
+        return
+    card = get_autopay_card()
+    if not card:
+        STATE.log(f"[{leg.name}] 자동결제 ON 이지만 카드 미등록 — 수동 결제 필요")
+        with STATE.lock:
+            if leg.result:
+                leg.result["autopay_status"] = "no_card"
+        return
+
+    paid_flags: list[bool] = []
+    last_err: str | None = None
+    for r in reserve_objs:
+        try:
+            srt.pay_with_card(
+                r, card["number"], card["password"],
+                card["birth"], card["expire"], 0, card["card_type"],
+            )
+            paid_flags.append(True)
+            STATE.log(f"[{leg.name}] [PAID] 자동결제 성공 {getattr(r, 'reservation_number', '')}")
+        except SRTError as e:
+            paid_flags.append(False)
+            last_err = str(e)
+            STATE.log(f"[{leg.name}] [PAY-FAIL] 자동결제 실패: {e}")
+        except Exception as e:  # noqa: BLE001 - 결제 예외로 워커 죽지 않게
+            paid_flags.append(False)
+            last_err = f"{type(e).__name__}: {e}"
+            STATE.log(f"[{leg.name}] [PAY-FAIL] 자동결제 오류: {last_err}")
+
+    ok_count = sum(paid_flags)
+    all_paid = ok_count == len(reserve_objs) and ok_count > 0
+    with STATE.lock:
+        if leg.result:
+            for item, ok in zip(leg.result.get("reservations", []), paid_flags):
+                if ok:
+                    item["paid"] = True
+            leg.result["paid"] = all_paid
+            leg.result["payment_status"] = "paid" if all_paid else "pay_failed"
+            leg.result["autopay_status"] = (
+                "paid" if all_paid else ("partial" if ok_count else "failed")
+            )
+            if last_err:
+                leg.result["autopay_error"] = last_err
+    invalidate_reservation_cache()
 
 
 def try_leg(srt: SRT, leg: LegState) -> bool:
@@ -1162,6 +1292,7 @@ def try_leg(srt: SRT, leg: LegState) -> bool:
                 leg.result = reservation_result("reserve", [r], [t], datetime.now())
             invalidate_reservation_cache()
             STATE.log(f"[{leg.name}] [SUCCESS] 예매 완료 (단일/연석)")
+            attempt_autopay(srt, leg, [r])
             notify_booking(leg)
             return True
         except SRTResponseError as e:
@@ -1178,6 +1309,7 @@ def try_leg(srt: SRT, leg: LegState) -> bool:
                     )
                 invalidate_reservation_cache()
                 STATE.log(f"[{leg.name}] [SUCCESS] 분할 예매 완료 ({adults}건)")
+                attempt_autopay(srt, leg, succeeded)
                 notify_booking(leg)
                 return True
             if succeeded:
@@ -1193,6 +1325,7 @@ def try_leg(srt: SRT, leg: LegState) -> bool:
                     f"[{leg.name}] [PARTIAL] {len(succeeded)}/{adults}좌석만 확보 "
                     f"({err}). 다음 폴링에서 추가 시도 안 함."
                 )
+                attempt_autopay(srt, leg, succeeded)
                 notify_booking(leg)
                 return True
             STATE.log(f"[{leg.name}]   분할 1좌석도 실패: {err}")
@@ -1697,6 +1830,44 @@ def api_update_me(
     return JSONResponse({"ok": True, "user": public_user(target)})
 
 
+@app.get("/api/card")
+def api_get_card(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
+    """자동결제 카드 등록 상태(뒤 4자리만)."""
+    return JSONResponse(card_public_status())
+
+
+@app.post("/api/card")
+def api_set_card(
+    payload: dict[str, Any],
+    user: dict[str, Any] = Depends(current_user),
+) -> JSONResponse:
+    """자동결제 카드 등록 (메모리 전용, 관리자만). 디스크에 저장하지 않음."""
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+    try:
+        set_autopay_card(
+            number=payload.get("number", ""),
+            password=payload.get("password", ""),
+            birth=payload.get("birth", ""),
+            expire=payload.get("expire", ""),
+            card_type=str(payload.get("card_type", "J")).upper(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    STATE.log(f"자동결제 카드 등록됨 (••••{card_public_status().get('last4', '')}) by {user['username']}")
+    return JSONResponse({"ok": True, **card_public_status()})
+
+
+@app.delete("/api/card")
+def api_delete_card(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
+    """자동결제 카드 삭제 (관리자만)."""
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+    clear_autopay_card()
+    STATE.log(f"자동결제 카드 삭제됨 by {user['username']}")
+    return JSONResponse({"ok": True, "registered": False})
+
+
 @app.get("/api/users")
 def api_list_users(user: dict[str, Any] = Depends(current_user)) -> JSONResponse:
     if not user.get("is_admin"):
@@ -1824,7 +1995,7 @@ def api_update_watch(
         if target is None:
             raise HTTPException(status_code=404, detail="watch not found")
         merged = dict(target)
-        for key in ("label", "dep", "arr", "date", "time_start", "time_end", "adults", "active", "seat_strategy"):
+        for key in ("label", "dep", "arr", "date", "time_start", "time_end", "adults", "active", "seat_strategy", "autopay"):
             if key in payload:
                 merged[key] = payload[key]
         # owner_id 보존 (PATCH 로 변경 불가)
@@ -2958,6 +3129,11 @@ HTML = """<!doctype html>
                     </div>
                 </div>
 
+                <label class="form-toggle-row" id="autopay-row">
+                    <input type="checkbox" id="autopay-toggle">
+                    <span><strong>예매 성공 시 자동결제</strong> · 등록된 카드로 즉시 결제까지 진행 (새벽 대응). 카드는 <a href="#" onclick="openMyAccount(); return false;">내 계정 → 자동결제 카드</a>에서 등록.</span>
+                </label>
+
                 <label class="form-toggle-row" id="round-trip-row">
                     <input type="checkbox" id="round-trip-toggle" onchange="toggleRoundTrip()">
                     <span><strong>왕복으로 추가</strong> · 오는편 감시도 동시에 등록 (출발/도착 자동 반전)</span>
@@ -3022,6 +3198,33 @@ HTML = """<!doctype html>
                         <input type="password" id="me-new-pw" placeholder="새 비밀번호 (4자 이상)" style="padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
                     </div>
                 </details>
+
+                <details id="card-section" style="margin-top: 0.75rem;" hidden>
+                    <summary style="cursor: pointer; font-size: 0.85rem; color: var(--text-muted);">자동결제 카드 <span id="card-status-chip" style="font-weight:600;"></span></summary>
+                    <div style="margin-top: 0.6rem; padding: 0.7rem 0.8rem; background:#fff7ed; border:1px solid #fed7aa; border-radius:8px; font-size:0.78rem; color:#9a3412; line-height:1.5;">
+                        ⚠️ 카드 정보는 <strong>서버 메모리에만</strong> 저장됩니다. 디스크·로그·watches 파일 어디에도 기록되지 않으며, <strong>서버 재시작 시 다시 입력</strong>해야 합니다. 자동결제를 켠 감시는 예매 성공 즉시 이 카드로 결제됩니다.
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.6rem;">
+                        <input type="text" id="card-number" inputmode="numeric" autocomplete="off" placeholder="카드번호 (숫자 15~16자리, 하이픈 제외)" style="padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
+                        <div style="display:flex; gap:0.5rem;">
+                            <input type="text" id="card-expire" inputmode="numeric" autocomplete="off" placeholder="유효기간 YYMM (예: 3103)" style="flex:1; padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
+                            <input type="password" id="card-password" inputmode="numeric" autocomplete="off" placeholder="비번 앞2자리" maxlength="2" style="width:7rem; padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
+                        </div>
+                        <div style="display:flex; gap:0.5rem;">
+                            <input type="text" id="card-birth" inputmode="numeric" autocomplete="off" placeholder="생년월일 YYMMDD (개인) / 사업자번호 (법인)" style="flex:1; padding: 0.55rem 0.75rem; border: 1px solid var(--border); border-radius: 8px;">
+                            <select id="card-type" style="width:8rem; padding: 0.55rem 0.5rem; border: 1px solid var(--border); border-radius: 8px;">
+                                <option value="J">개인(J)</option>
+                                <option value="S">법인(S)</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; gap:0.5rem; align-items:center;">
+                            <button type="button" class="btn btn-primary btn-sm" onclick="saveCard()">카드 등록/변경</button>
+                            <button type="button" class="btn btn-sm btn-danger" onclick="deleteCard()">카드 삭제</button>
+                            <span id="card-result" class="form-result" style="margin:0;"></span>
+                        </div>
+                    </div>
+                </details>
+
                 <div id="account-result" class="form-result" style="margin-top: 0.75rem;"></div>
             </div>
             <div class="modal-footer">
@@ -3178,6 +3381,7 @@ HTML = """<!doctype html>
                         const isPartialExpired = r.payment_status === 'partially_paid_expired';
                         const isPartial = !!r.partial;
                         const isSplit = !!r.split;
+                        const payFailed = !isPaid && (r.payment_status === 'pay_failed' || ['failed','partial','no_card'].includes(r.autopay_status));
                         const reservations = r.reservations || [];
 
                         const untilRemaining = formatRemaining(secondsUntil(r.payment_check_until));
@@ -3185,7 +3389,8 @@ HTML = """<!doctype html>
 
                         let statusText, bannerKind;
                         if (isStandby)              { statusText = '예약대기 등록됨'; bannerKind = 'standby'; }
-                        else if (isPaid)            { statusText = '결제 확인됨'; bannerKind = ''; }
+                        else if (isPaid)            { statusText = (r.autopay_status === 'paid' ? '자동결제 완료 ✅' : '결제 확인됨'); bannerKind = ''; }
+                        else if (payFailed)         { statusText = '⚠️ 자동결제 실패 — 마감 전 수동 결제 필요'; bannerKind = 'expired'; }
                         else if (isExpired)         { statusText = '결제 마감 — 미결제 (자동 재예매 안 함)'; bannerKind = 'expired'; }
                         else if (isPartialExpired)  { statusText = '결제 마감 — 일부 결제'; bannerKind = 'expired'; }
                         else if (isPartial)         { statusText = `부분 예매 (${reservations.length}/${r.requested_adults || leg.adults}좌석)`; bannerKind = 'standby'; }
@@ -3213,7 +3418,10 @@ HTML = """<!doctype html>
                         if (isStandby) paymentLine = '예약대기 등록 상태입니다.';
                         else if (isPaid) paymentLine = `결제 확인 시각: ${formatTime(r.payment_checked_at)}`;
                         else if (isExpired || isPartialExpired) paymentLine = `결제 마감 지남. '결과 초기화' 버튼으로 재감시 시작 가능.`;
-                        else paymentLine = `<span class="payment-timer ${secondsUntil(r.payment_check_until) !== null && secondsUntil(r.payment_check_until) < 600 ? 'urgent' : ''}">결제 마감까지 ${untilRemaining}</span> <span style="color: var(--text-muted); font-size: 0.75rem;">다음 확인: ${formatTime(r.next_payment_check_at)}</span>`;
+                        else {
+                            const warn = payFailed ? `<div style="color: var(--danger); font-weight: 600; margin-bottom: 0.25rem;">자동결제 실패${r.autopay_error ? ' (' + r.autopay_error + ')' : ''} — 아래 기한 안에 SRT 앱에서 직접 결제하세요.</div>` : '';
+                            paymentLine = warn + `<span class="payment-timer ${secondsUntil(r.payment_check_until) !== null && secondsUntil(r.payment_check_until) < 600 ? 'urgent' : ''}">결제 마감까지 ${untilRemaining}</span> <span style="color: var(--text-muted); font-size: 0.75rem;">다음 확인: ${formatTime(r.next_payment_check_at)}</span>`;
+                        }
 
                         resultHtml = `
                             <div class="result-banner ${bannerKind}">
@@ -3263,6 +3471,12 @@ HTML = """<!doctype html>
                         ? `<span class="leg-status-pill ${leg.seat_strategy === 'split_ok' ? 'split' : 'paused'}">${leg.seat_strategy === 'split_ok' ? '분할 허용' : '같이만'}</span>`
                         : '';
 
+                    // 자동결제 배지 (카드 미등록 시 경고)
+                    const cardReady = state.card_registered;
+                    const autopayBadge = leg.autopay
+                        ? `<span class="leg-status-pill ${cardReady ? 'booked' : 'expired'}" title="${cardReady ? '예매 성공 시 등록된 카드로 자동결제' : '자동결제 ON 이지만 카드 미등록 — 수동 결제 필요'}">💳 자동결제${cardReady ? '' : ' (카드 미등록)'}</span>`
+                        : '';
+
                     let pillClass = 'active', pillLabel = '감시 중', pillPulse = true;
                     if (!leg.active) { pillClass = 'paused'; pillLabel = '일시정지'; pillPulse = false; }
                     else if (leg.awaiting_window_open_at) {
@@ -3278,7 +3492,7 @@ HTML = """<!doctype html>
                     else if (r0 && r0.partial) { pillClass = 'partial'; pillLabel = `부분 ${(r0.reservations||[]).length}좌석`; pillPulse = true; }
                     else if (r0 && r0.split) { pillClass = 'split'; pillLabel = `분할 ${(r0.reservations||[]).length}건`; pillPulse = true; }
                     else if (r0) { pillClass = 'booked'; pillLabel = '예매 완료'; pillPulse = true; }
-                    const pillHtml = `<span class="leg-status-pill ${pillClass}">${pillPulse ? '<span class="pulse-mini"></span>' : ''}${pillLabel}</span>${strategyBadge}`;
+                    const pillHtml = `<span class="leg-status-pill ${pillClass}">${pillPulse ? '<span class="pulse-mini"></span>' : ''}${pillLabel}</span>${strategyBadge}${autopayBadge}`;
                     const safeLabel = leg.label.replace(/'/g, "&#39;");
 
                     card.innerHTML = `
@@ -3301,6 +3515,7 @@ HTML = """<!doctype html>
                             <div class="leg-actions">
                                 <button class="btn btn-sm btn-edit" onclick='startEdit(${JSON.stringify(leg).replace(/'/g, "&#39;")})'>수정</button>
                                 ${resetBtn}
+                                <button class="btn btn-sm" onclick="toggleAutopay('${leg.id}', ${!leg.autopay})">${leg.autopay ? '자동결제 끄기' : '자동결제 켜기'}</button>
                                 <button class="btn btn-sm" onclick="toggleWatch('${leg.id}', ${!leg.active})">${pauseLabel}</button>
                                 <button class="btn btn-sm btn-danger" onclick="deleteWatch('${leg.id}', '${safeLabel}')">삭제</button>
                             </div>
@@ -3575,6 +3790,7 @@ HTML = """<!doctype html>
             const radios = form.querySelectorAll('input[name="seat_strategy"]');
             radios.forEach(r => { r.checked = (r.value === strat); });
             updateSeatStrategyVisibility();
+            document.getElementById('autopay-toggle').checked = !!leg.autopay;
 
             document.getElementById('form-id').value = leg.id;
             // 왕복 토글은 편집에선 사용 안 함
@@ -3625,6 +3841,7 @@ HTML = """<!doctype html>
                 time_end: data.get('time_end'),
                 adults: Number(data.get('adults')),
                 seat_strategy: data.get('seat_strategy') || 'split_ok',
+                autopay: document.getElementById('autopay-toggle').checked,
             };
 
             try {
@@ -3642,6 +3859,7 @@ HTML = """<!doctype html>
                         time_end: data.get('return_time_end'),
                         adults: payload.adults,
                         seat_strategy: payload.seat_strategy,
+                        autopay: payload.autopay,
                     };
                     await createWatch(payload);
                     await createWatch(returnPayload);
@@ -3678,6 +3896,15 @@ HTML = """<!doctype html>
                 updateDashboard();
             } catch (err) {
                 alert('네트워크 오류: ' + err);
+            }
+        }
+
+        async function toggleAutopay(id, autopay) {
+            try {
+                await patchWatch(id, {autopay});
+                updateDashboard();
+            } catch (err) {
+                alert('자동결제 변경 실패: ' + (err.message || err));
             }
         }
 
@@ -3759,6 +3986,9 @@ HTML = """<!doctype html>
                 document.getElementById('me-notify-toggle').checked = !!me.notify_enabled;
                 document.getElementById('me-current-pw').value = '';
                 document.getElementById('me-new-pw').value = '';
+                const cardSection = document.getElementById('card-section');
+                if (me.is_admin) { cardSection.hidden = false; loadCardStatus(); }
+                else { cardSection.hidden = true; }
                 const resultEl = document.getElementById('account-result');
                 resultEl.textContent = '';
                 resultEl.className = 'form-result';
@@ -3813,6 +4043,74 @@ HTML = """<!doctype html>
                 resultEl.textContent = '오류: ' + e;
                 resultEl.className = 'form-result error';
             }
+        }
+
+        function renderCardChip(status) {
+            const chip = document.getElementById('card-status-chip');
+            if (status && status.registered) {
+                chip.textContent = `· 등록됨 ••••${status.last4} (${status.card_type === 'S' ? '법인' : '개인'})`;
+                chip.style.color = 'var(--success)';
+            } else {
+                chip.textContent = '· 미등록';
+                chip.style.color = 'var(--text-muted)';
+            }
+        }
+
+        async function loadCardStatus() {
+            try {
+                const res = await fetchAuth('/api/card');
+                renderCardChip(await res.json());
+            } catch (e) { /* ignore */ }
+        }
+
+        async function saveCard() {
+            const resultEl = document.getElementById('card-result');
+            const payload = {
+                number: document.getElementById('card-number').value,
+                expire: document.getElementById('card-expire').value,
+                password: document.getElementById('card-password').value,
+                birth: document.getElementById('card-birth').value,
+                card_type: document.getElementById('card-type').value,
+            };
+            try {
+                const res = await fetchAuth('/api/card', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    resultEl.textContent = data.detail || '등록 실패';
+                    resultEl.className = 'form-result error';
+                    return;
+                }
+                // 입력값은 화면에서 즉시 비움 (브라우저에 남기지 않음)
+                ['card-number','card-expire','card-password','card-birth'].forEach(id => document.getElementById(id).value = '');
+                renderCardChip(data);
+                resultEl.textContent = '카드 등록됨 (메모리)';
+                resultEl.className = 'form-result success';
+            } catch (e) {
+                if (e.message === 'not authenticated') return;
+                resultEl.textContent = '오류: ' + e;
+                resultEl.className = 'form-result error';
+            }
+        }
+
+        async function deleteCard() {
+            if (!confirm('등록된 자동결제 카드를 삭제할까요?')) return;
+            const resultEl = document.getElementById('card-result');
+            try {
+                const res = await fetchAuth('/api/card', {method: 'DELETE'});
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    resultEl.textContent = data.detail || '삭제 실패';
+                    resultEl.className = 'form-result error';
+                    return;
+                }
+                renderCardChip({registered: false});
+                resultEl.textContent = '카드 삭제됨';
+                resultEl.className = 'form-result success';
+            } catch (e) { /* ignore */ }
         }
 
         // Initial update and interval
